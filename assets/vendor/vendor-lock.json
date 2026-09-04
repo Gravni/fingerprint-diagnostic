@@ -1,54 +1,212 @@
 {
-  "_comment": "Vendored control-engine provenance (Codex v4.3 #11): upstream source, pinned commit/tag, source SHA-256, build toolchain + command, and the SHA-256 of the shipped output. Verified by scripts/fp-vendor.test.mjs.",
+  "schemaVersion": 1,
+  "_comment": "Canonical inventory of local vendor artifacts, source inputs and supplied provenance metadata. scripts/fp-vendor.test.mjs reads all artifact/source SHA-256 values from this file; no second digest table is maintained. This file is not proof of upstream identity or reproducible builds where the exact source commit and all build inputs are absent.",
+  "verificationScope": {
+    "verifiedLocally": [
+      "listed artifact SHA-256 values",
+      "listed source-file SHA-256 values where present",
+      "ThumbmarkJS and FingerprintJS artifacts are byte-identical to the named files in the recorded npm tarballs",
+      "FPScanner, fpcollect and ua-parser-js source inputs are byte-identical to the named files in the recorded npm tarballs",
+      "presence of the enumerated non-empty license files and selected static collector configuration checked by scripts/fp-vendor.test.mjs"
+    ],
+    "notEstablishedByThisFile": [
+      "upstream source identity for artifacts without a commit/source archive hash",
+      "byte-for-byte rebuild reproducibility",
+      "runtime no-egress",
+      "complete transitive-license or vulnerability audit"
+    ]
+  },
   "engines": {
     "thumbmark": {
       "name": "ThumbmarkJS",
       "version": "1.11.0",
       "license": "MIT",
+      "licenseEvidence": "assets/vendor/thumbmark/LICENSE",
+      "licenseFiles": [
+        "assets/vendor/thumbmark/LICENSE"
+      ],
       "upstream": "https://github.com/thumbmarkjs/thumbmarkjs",
+      "upstreamTag": "v1.11.0",
+      "upstreamCommit": "0d14734b667a659e3f99a035c0226fabfc75f8f3",
+      "npm": {
+        "package": "@thumbmarkjs/thumbmarkjs@1.11.0",
+        "tarball": "https://registry.npmjs.org/@thumbmarkjs/thumbmarkjs/-/thumbmarkjs-1.11.0.tgz",
+        "integrity": "sha512-aJ7lwzR2sd1EIk8o+T1TATkxbqBPsW3u6AGGg1DGMAQ358yHlVWmBTFj2dJVE4/zuJEtx0gHJPNCErsyplBR7g==",
+        "shasum": "3f83d37033c00395acaaf13cf58e5b84849e82ad",
+        "artifactPath": "package/dist/thumbmark.umd.js"
+      },
       "file": "assets/vendor/thumbmark/thumbmark-1.11.0.umd.js",
       "outputSha256": "5a12ec3d520aa95b7df0e54ab653c9c594cb8d89a430011c01cd1f8a5deb4bae",
-      "build": "upstream prebuilt UMD (vendored as-is)",
-      "patches": []
+      "artifactOrigin": "published npm prebuilt UMD; byte-identical to the recorded npm tarball member",
+      "provenanceStatus": "release tag/commit, npm tarball integrity and exact artifact member verified 2026-09-04; source rebuild not reproduced",
+      "patchesRecorded": []
     },
     "fingerprintjs": {
       "name": "FingerprintJS OSS",
       "version": "5.0.0",
       "license": "MIT",
+      "licenseEvidence": "artifact header and assets/vendor/fingerprintjs/LICENSE",
+      "licenseFiles": [
+        "assets/vendor/fingerprintjs/LICENSE"
+      ],
       "upstream": "https://github.com/fingerprintjs/fingerprintjs",
+      "upstreamTag": "v5.0.0",
+      "upstreamCommit": "571a0a6136f78911d5fbcb91fdc3fe711ff25537",
+      "npm": {
+        "package": "@fingerprintjs/fingerprintjs@5.0.0",
+        "tarball": "https://registry.npmjs.org/@fingerprintjs/fingerprintjs/-/fingerprintjs-5.0.0.tgz",
+        "integrity": "sha512-p5tSR6BVigkYUOX1isAnEKdXCD49iKy+MEAs2GRrxRIRSeL8sjluaATlV7g3AsoZNXAiDeGz37iuJqxt8xmUHg==",
+        "shasum": "f0177740daae8d0a15fb639b9273d5213a41a440",
+        "artifactPath": "package/dist/fp.umd.min.js"
+      },
       "file": "assets/vendor/fingerprintjs/fp.v5.0.0.umd.min.js",
       "outputSha256": "d089678feb7cd84853cb5f0266d6568a3c751c3c204545b70c9013c29cc292f1",
-      "build": "upstream prebuilt UMD (vendored as-is)",
-      "patches": []
+      "artifactOrigin": "published npm prebuilt UMD; byte-identical to the recorded npm tarball member",
+      "provenanceStatus": "release tag/commit, npm tarball integrity and exact artifact member verified 2026-09-04; source rebuild not reproduced",
+      "patchesRecorded": []
     },
     "fpscanner": {
       "name": "FPScanner + fp-collect",
-      "version": "fpscanner@0.1.5 + fpcollect@1.0.5",
-      "license": "MIT (+ ua-parser-js 0.7.40 elected MIT)",
-      "upstream": ["https://github.com/antoinevastel/fpscanner", "https://github.com/antoinevastel/fp-collect"],
+      "version": "fpscanner@0.1.5 + fp-collect@1.0.5",
+      "license": "MIT; bundled ua-parser-js source identifies itself as MIT",
+      "licenseEvidence": "assets/vendor/fpscanner/LICENSE and header in assets/vendor/fpscanner/src/ua-parser-0.7.40.js",
+      "licenseFiles": [
+        "assets/vendor/fpscanner/LICENSE",
+        "assets/vendor/fpscanner/fpcollect-LICENSE",
+        "assets/vendor/fpscanner/ua-parser-js-LICENSE.md",
+        "assets/vendor/fpscanner/NOTICE"
+      ],
+      "upstream": [
+        "https://github.com/antoinevastel/fpscanner",
+        "https://github.com/antoinevastel/fp-collect",
+        "https://github.com/faisalman/ua-parser-js"
+      ],
       "sources": {
         "assets/vendor/fpscanner/src/fpCollect.js": "cb9b75f5ff9e4b89351b78b5948fa415e8c18f1f1383104573a495152bdcbeee",
         "assets/vendor/fpscanner/src/fpScanner.js": "5bee77aee550ba9c76a8607f7c85ffccd45b724e9b3a32d10bf5970258fdfbfa",
         "assets/vendor/fpscanner/src/ua-parser-0.7.40.js": "95a6709df518be681ad7f8ac624cc5529f1c066d66a33fd1fdc1276d518fd60e"
       },
-      "toolchain": "esbuild@0.24.0",
-      "buildCommand": "esbuild entry.js --bundle --format=iife --alias:ua-parser-js=./ua-parser.js --minify   (entry: window.fpCollect=require('./fpCollect.js'); window.fpScanner=require('./fpScanner.js'))",
+      "npmInputs": [
+        {
+          "package": "fpscanner@0.1.5",
+          "tarball": "https://registry.npmjs.org/fpscanner/-/fpscanner-0.1.5.tgz",
+          "integrity": "sha512-DNHW1xDndAj1WEfmaXwSnT/CRYenoB5unfJyYY+aFBGPjXb5zdbWPLUeMnskci0naZBxIcG7aF/LMl4sFVwi9Q==",
+          "shasum": "f4eb26cd5414f3eff2a0714726691de1a5c39e9a",
+          "gitHead": "cf1d0c1cbe53bba244c14862cb8c30ec92176fb3",
+          "sourcePath": "package/src/fpScanner.js"
+        },
+        {
+          "package": "fpcollect@1.0.5",
+          "tarball": "https://registry.npmjs.org/fpcollect/-/fpcollect-1.0.5.tgz",
+          "integrity": "sha512-IZBlcncoRT+NDIGGYIA9TQtvnNA2cKhu/6Q5BhyY+13QskgI5u7URDiHFUjNjeumJbbhpf8/q8YlbhbJ6cN+bA==",
+          "shasum": "80ecdd6a318c387a7ab6ac20c19d437adbd2b700",
+          "gitHead": "7a49625651a61c1b8b9a6114b841fe74c7ec3b31",
+          "sourcePath": "package/src/fpCollect.js"
+        },
+        {
+          "package": "ua-parser-js@0.7.40",
+          "tarball": "https://registry.npmjs.org/ua-parser-js/-/ua-parser-js-0.7.40.tgz",
+          "integrity": "sha512-us1E3K+3jJppDBa3Tl0L3MOJiGhe1C6P0+nIvQAFYbxlMAx0h81eOwLmU57xgqToduDDPx3y5QsdjPfDu+FgOQ==",
+          "shasum": "c87d83b7bb25822ecfa6397a0da5903934ea1562",
+          "gitHead": "5c811b80060f9c568662102cf3b9fee2aaf56545",
+          "sourcePath": "package/src/ua-parser.js"
+        }
+      ],
+      "declaredToolchain": "esbuild@0.24.0",
+      "declaredBuildCommand": "esbuild entry.js --bundle --format=iife --alias:ua-parser-js=./ua-parser.js --minify",
       "file": "assets/vendor/fpscanner/fpscanner.bundle.js",
       "outputSha256": "8414f22e6f2466dae55c37b8c8375344679f9469f58590a333d00a16bdc6982c",
-      "patches": ["ua-parser-js pinned 0.7.40 (>=0.7.33, avoids GHSA-fhg7-m89q-25r3; NEVER 1.x/2.x = AGPL)"]
+      "bundleConfiguration": [
+        "entry exposes fpCollect and fpScanner as browser globals",
+        "bundle input selects the vendored ua-parser-js 0.7.40 file"
+      ],
+      "provenanceStatus": "all three retained source inputs match the recorded npm tarball members; bundle output is pinned, but the complete build workspace/lock needed to reproduce it is not retained"
     },
     "clientjs": {
       "name": "ClientJS",
       "version": "0.2.1",
       "license": "Apache-2.0",
+      "licenseEvidence": "assets/vendor/clientjs/LICENSE",
+      "licenseFiles": [
+        "assets/vendor/clientjs/LICENSE",
+        "assets/vendor/clientjs/NOTICE",
+        "assets/vendor/clientjs/globalthis-LICENSE",
+        "assets/vendor/clientjs/define-properties-LICENSE",
+        "assets/vendor/clientjs/object-keys-LICENSE",
+        "assets/vendor/clientjs/murmurhash-js-LICENSE",
+        "assets/vendor/clientjs/ua-parser-js-LICENSE.md"
+      ],
       "upstream": "https://github.com/jackspirou/clientjs",
-      "commit": "8f98834b19440cb6bc96048d23b8886d4e32dddc",
-      "tag": "v0.2.1",
-      "toolchain": "webpack (repo config) on node 22, NODE_OPTIONS=--openssl-legacy-provider",
-      "buildCommand": "npm ci --ignore-scripts && npm i --save-exact --ignore-scripts ua-parser-js@0.7.41 && npx webpack -c webpack.config.js",
+      "declaredCommit": "8f98834b19440cb6bc96048d23b8886d4e32dddc",
+      "declaredTag": "v0.2.1",
+      "declaredTagObject": "b9db6bccc5aca20c463117ce435acc13b1c48a1a",
+      "publishedNpmMetadata": {
+        "package": "clientjs@0.2.1",
+        "tarball": "https://registry.npmjs.org/clientjs/-/clientjs-0.2.1.tgz",
+        "integrity": "sha512-HN7yzgq8xMDjkNpSnpH3foMxaX5q9CUMcLAIsNwNnbJnuEhR8CDRxm22mEo+uQdiOUkCl5ZjdoN9lGBbL4jutQ==",
+        "shasum": "1b954a0afec9e6e1056f21a2c3107aca37fc2869",
+        "gitHead": "ce103dc29da3ad09805d78ca4494d8f356c97db0"
+      },
+      "declaredToolchain": "webpack repository configuration on Node 22 with --openssl-legacy-provider",
+      "declaredBuildCommand": "npm ci --ignore-scripts; install exact ua-parser-js@0.7.41 without scripts; run webpack -c webpack.config.js",
       "file": "assets/vendor/clientjs/clientjs-0.2.1.base.min.js",
       "outputSha256": "5077379fc482d99daeceafb9b63cac07e24f29c6dfba28c445baf3f2ce4d9f22",
-      "patches": ["REBUILT from src with ua-parser-js 0.7.41 (was 0.7.30, GHSA-fhg7-m89q-25r3 / CVE-2022-25927 ReDoS)"]
+      "artifactObservation": "contains a 0.7.41 marker and no 0.7.30 marker",
+      "embeddedComponents": [
+        {
+          "id": "globalthis",
+          "version": "1.0.2",
+          "license": "MIT",
+          "provenance": "ClientJS src/client.base.js imports globalthis/polyfill; version is locked by the declared ClientJS commit's package-lock.json",
+          "upstream": "https://github.com/ljharb/System.global",
+          "npmIntegrity": "sha512-ZQnSFO1la8P7auIOQECnm0sSuoMeaSq0EEdXMBFF2QJO4uNcwbyhSgG3MruWNbFTqCLmxVwGOl7LZ9kASvHdeQ==",
+          "npmGitHead": "0aa16d5fa8ba9b97058960fe98f56d55573f085b"
+        },
+        {
+          "id": "define-properties",
+          "version": "1.1.3",
+          "license": "MIT",
+          "provenance": "transitive runtime dependency of globalthis 1.0.2 in the declared ClientJS commit's package-lock.json",
+          "upstream": "https://github.com/ljharb/define-properties",
+          "npmIntegrity": "sha512-3MqfYKj2lLzdMSf8ZIZE/V+Zuy+BgD6f164e8K2w7dgnpKArBDerGYpM46IYYcjnkdPNMjPk9A6VFB8+3SKlXQ==",
+          "npmGitHead": "e5478e3d2880b90a97daa62d76abed34d91154dd"
+        },
+        {
+          "id": "object-keys",
+          "version": "1.1.1",
+          "license": "MIT",
+          "provenance": "transitive runtime dependency of define-properties 1.1.3 in the declared ClientJS commit's package-lock.json",
+          "upstream": "https://github.com/ljharb/object-keys",
+          "npmIntegrity": "sha512-NuAESUOUMrlIXOfHKzD6bpPu3tYt3xvjNdRIQ+FeT0lNb4K8WR70CaDxhuNguS2XG+GjkyMwOzsN5ZktImfhLA==",
+          "npmGitHead": "ba2c1989270c7de969aa8498fc3b7c8e677806f3"
+        },
+        {
+          "id": "murmurhash-js",
+          "version": "1.0.0",
+          "license": "MIT",
+          "provenance": "ClientJS src/client.base.js imports murmurhash-js/murmurhash3_gc; version is locked by the declared ClientJS commit's package-lock.json",
+          "upstream": "https://github.com/mikolalysenko/murmurhash-js",
+          "npmIntegrity": "sha512-TvmkNhkv8yct0SVBSy+o8wYzXjE4Zz3PCesbfs8HiCXXdcTuocApFv11UWlNFWKYsP2okqrhb7JNlSm9InBhIw==",
+          "npmGitHead": "72aabce3f52cb8f16245692a69fd35951e165af0"
+        },
+        {
+          "id": "ua-parser-js",
+          "version": "0.7.41",
+          "license": "MIT",
+          "provenance": "exact version locally substituted during the declared ClientJS rebuild; the output contains its version marker, but the patched lock/source tree is not retained",
+          "upstream": "https://github.com/faisalman/ua-parser-js",
+          "npmIntegrity": "sha512-O3oYyCMPYgNNHuO7Jjk3uacJWZF8loBgwrfd/5LE/HyZ3lUIOdniQ7DNXJcIgZbwioZxk0fLfI4EVnetdiX5jg==",
+          "npmGitHead": "af825ff5574d63122dec5a3261f7933044001a1c"
+        },
+        {
+          "id": "fontdetect",
+          "version": "0.3",
+          "license": "Apache-2.0",
+          "provenance": "ClientJS src/client.base.js imports src/vendor/fontdetect.js; upstream source header identifies Lalit Patel, version 0.3 and Apache-2.0",
+          "upstream": "http://www.lalit.org/lab/javascript-css-font-detect/"
+        }
+      ],
+      "provenanceStatus": "artifact, release tag commit, modification notice and embedded-component license notices are recorded; source tree, patched lock, config and build log needed for reproduction are absent"
     }
   }
 }

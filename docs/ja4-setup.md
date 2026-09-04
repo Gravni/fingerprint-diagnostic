@@ -1,80 +1,73 @@
-# Сетевой слой отпечатка (JA4) — развёртывание
+# Network fingerprint capture — deployment boundary
 
-JS-проба снимает всё на уровне страницы. Но **сетевой слой** — TLS ClientHello,
-JA4, порядок шифров/расширений, ALPN — виден только тому, кто терминирует TLS.
-Cloudflare терминирует его за панель, поэтому нужен **отдельный приёмник на
-своём домене, направленном прямо на сервер**, мимо туннеля.
+Page JavaScript cannot observe the TLS ClientHello or the initial HTTP/2 SETTINGS
+frame. Those values are visible only at a capture endpoint that terminates the
+browser's TLS connection directly. A CDN or reverse proxy that terminates TLS
+first changes the observed client to that intermediary.
 
-Тогда в сравнении «обычный vs антик» появляется контекст `network` с JA4 — и
-видно, меняет ли антик сетевой слой (почти все дешёвые не трогают → JA4 течёт).
+## Source present in this repository
 
-## Что уже готово в коде
+- `lib/ja4.ts` parses ClientHello data and computes JA3/JA4-format values.
+- `lib/h2-observe.mjs` observes the HTTP/2 client preface and first SETTINGS
+  frame, then preserves the bytes for Node's HTTP/2 stack.
+- `scripts/capture-server.mjs` is the standalone capture process.
 
-- `lib/ja4.ts` — разбор ClientHello + JA4/JA3 (проверен на живом рукопожатии).
-- `scripts/capture-server.mjs` — приёмник: читает рукопожатие, считает JA4,
-  отдаёт результат панели по токену.
-- Панель: выдаёт токен (`/api/fingerprint/net-token`), принимает результат
-  (`/api/fingerprint/net-result`), кнопки subjectа уже дёргают сетевой слой.
-- Приёмник неактивен, пока не задан `CAPTURE_URL` — тогда фронт его просто не
-  предлагает, ничего не ломается.
+The production panel routes that mint tokens, persist network results, report
+side readiness, and export data are not in this repository. Their existence or
+deployment must not be inferred from the capture source.
 
-## Что нужно один раз (root)
+## Required topology
 
-1. **Домен для приёмника**, A-записью **прямо на IP** (мимо Cloudflare):
-   ```
-   A   fp.твойдомен.com   →   203.0.113.10
-   ```
-   Это отдельный от панели вход — панель может жить за туннелем, приёмнику
-   нужен прямой доступ.
+Use a dedicated hostname whose DNS points directly to the capture server and a
+certificate valid for that hostname. Keep the panel behind its normal ingress if
+desired, but ensure the browser-to-capture TLS connection is not terminated by a
+third party first.
 
-2. **Сертификат** для этого домена (нужен настоящий: браузер должен завершить
-   запрос, несущий токен). Проще всего через certbot в standalone-режиме —
-   порт 80 на время выпуска:
-   ```bash
-   sudo certbot certonly --standalone -d fp.твойдомен.com
-   ```
+Required configuration values are read by `scripts/capture-server.mjs`; inspect
+the current source before deployment rather than copying an old command from this
+document. At minimum, provision the certificate/key, shared capture secret, panel
+callback URL, and listening port without committing secrets to Git.
 
-3. **Общий секрет** — любая длинная строка, одинаковая у панели и приёмника:
-   ```bash
-   openssl rand -hex 24     # скопировать значение
-   ```
+## `net-v6` request lifecycle
 
-4. **Запустить приёмник** (под root — порт 443 привилегированный; либо порт
-   >1024 без root, но тогда адрес будет с портом):
-   ```bash
-   sudo CERT_FILE=/etc/letsencrypt/live/fp.твойдомен.com/fullchain.pem \
-        KEY_FILE=/etc/letsencrypt/live/fp.твойдомен.com/privkey.pem \
-        CAPTURE_SECRET=<секрет> PANEL_URL=http://127.0.0.1:3400 PORT=443 \
-        node --experimental-strip-types scripts/capture-server.mjs
-   ```
-   (лучше завернуть в systemd или tmux, чтобы жил после выхода)
+The integration must mint one token and make exactly two logical requests per
+side with that same token:
 
-5. **Сказать панели про приёмник** — добавить в `.env.local` панели и
-   перезапустить (`./deploy.sh`):
-   ```
-   CAPTURE_URL=https://fp.твойдомен.com
-   CAPTURE_SECRET=<тот же секрет>
-   ```
+1. round 1 establishes the `Accept-CH` policy and is not persisted as the final
+   measurement;
+2. round 2 consumes the token, carries the advertised hints, and becomes the
+   single final `net-v6`
+   record;
+3. the capture server waits for durable panel persistence before returning
+   success;
+4. only that successful response lets the browser mark network `finished`.
 
-## После этого
+Do not send `Critical-CH` on the probe or capture responses. It may introduce an
+implicit browser retry outside the explicit two-request protocol. Retries must be
+idempotent or explicitly represented; they may not silently create duplicate
+network records.
 
-subject жмёт «снять из обычного браузера» / «из антика» — открывается **две**
-вкладки: JS-проба и приёмник JA4. В админке «отпечатки» → «сравнить» в списке
-параметров появляется `network.ja4`, `network.alpnOffered` и т.д. — plain vs
-anti, с вердиктом протекло/подменено.
+For HTTP/2, the final record is expected to include the negotiated protocol, the
+first SETTINGS payload/order/effective values, its hash, and received
+pseudo-header order. It also includes the socket-observed peer IP/family, exact
+TLS termination marker, the source-tree `captureBuild`, and the executing Node,
+V8, OpenSSL and nghttp2 versions under `captureRuntime`. Node's `rawHeaders` supplies request-header receive order;
+the custom observer is only for the initial SETTINGS frame.
 
-## Проверка
+## Verification before production use
 
-```bash
-# приёмник отвечает и снимает рукопожатие (сертификат самоподписанный без
-# CERT_FILE — только для локальной проверки):
-CAPTURE_SECRET=x PANEL_URL=http://127.0.0.1:3400 PORT=8443 \
-  node --experimental-strip-types scripts/capture-server.mjs
-# в логе: «приёмник JA4 слушает :8443»
-```
+1. Run `bash scripts/fp-test.sh` on the exact Git revision to deploy. Some network
+   tests bind a loopback port.
+2. Integrate and review the panel callbacks and strict `side-status` route using
+   `SERVER-INTEGRATION-HANDOFF.md`.
+3. Build and deploy with real component build IDs, not `unknown`, a schema label,
+   or an old archive hash.
+4. Run a real browser capture and inspect the persisted round-2 record. Confirm
+   `net-v6`, HTTP/2, SETTINGS, pseudo-header order, typed TLS/header vectors, and
+   the expected build IDs.
+5. Run both plain and anti in the automated paired smoke before the final human
+   capture.
 
-## Ограничение
-
-HTTP/2 SETTINGS-отпечаток (ещё один сетевой сигнал) пока не снимается —
-приёмник согласует http/1.1, чтобы прочитать запрос с токеном. JA4 и ALPN
-покрывают основное; h2-слой — отдельная доработка, если понадобится.
+A successful local parser test proves protocol logic only. It does not prove DNS,
+certificate, ingress, panel persistence, deployment revision, or live browser
+behavior.

@@ -1,22 +1,22 @@
 Third-party control engine — ThumbmarkJS
 ========================================
 
-File:     thumbmark-1.11.0.umd.js
-Source:   @thumbmarkjs/thumbmarkjs v1.11.0 (npm, pinned)
-License:  MIT (see ./LICENSE) — Copyright (c) 2024 Ilkka
-Use:      Independent, second fingerprint component set, run in the probe as a
-          CONTROL (Codex TZ §7). Its raw components are stored under a separate
-          namespace (control.*); our collector's result does NOT depend on it.
+Local file:  thumbmark-1.11.0.umd.js
+Version:     1.11.0 (declared by the artifact inventory)
+Upstream:    https://github.com/thumbmarkjs/thumbmarkjs
+Tag/commit:  v1.11.0 / 0d14734b667a659e3f99a035c0226fabfc75f8f3
+License:     MIT; see ./LICENSE
+SHA-256:     5a12ec3d520aa95b7df0e54ab653c9c594cb8d89a430011c01cd1f8a5deb4bae
 
-Control-engine roster (corrected per Codex v4 review)
------------------------------------------------------
-The minimal control set is FOUR independent engines. Thumbmark is one of them.
-- FingerprintJS OSS **v5 is MIT** (the BSL concern was about v4) — NOW VENDORED
-  alongside Thumbmark. See ../fingerprintjs/NOTICE.md.
-- CreepJS (MIT) — PENDING: extract only the useful raw sections into a renamed,
-  self-hosted adapter under our namespace control.consistency.* (no upstream UI/
-  backend; trademark-safe rename).
-- FPScanner (MIT) — PENDING: verify + pin by commit, adapt the useful checks.
+The artifact is stored locally in this repository, while the application route
+that serves it is outside this core-only tree. The browser probe calls
+setOption('logging', false), and a static regression test covers that setting.
+The vendored artifact contains upstream network-capable code/defaults, so only a
+runtime browser request ledger can prove no egress for a deployed build.
 
-Thumbmark telemetry: sampled logging is disabled (logging:false) so it makes no
-external requests on the measurement stand. See ../../../THIRD_PARTY_NOTICES.md.
+The local file was verified byte-for-byte against `dist/thumbmark.umd.js` in the
+published npm tarball for `@thumbmarkjs/thumbmarkjs@1.11.0`. Its registry
+integrity and release commit are recorded in `../vendor-lock.json`. A source
+rebuild was not attempted.
+See ../../../THIRD_PARTY_NOTICES.md and ../vendor-lock.json for the complete local
+inventory and known provenance gaps.

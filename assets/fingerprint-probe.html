@@ -12,9 +12,9 @@
 /* ============================================================================
    Глубокий сборщик отпечатка.
 
-   Пишется ОДИН раз как функция COLLECTOR(root). Для воркеров/воркета её
-   исходник берётся через .toString() — копии в строке больше нет, править
-   нужно одно место.
+   Пишется ОДИН раз как функция COLLECTOR(root). Серверный renderer извлекает
+   её точные байты после обязательных inject-подстановок и вшивает immutable
+   строку для воркеров/ворклета/iframe. Runtime Function#toString не доверяем.
 
    Два принципа:
    1. Полнота. Помимо точечных активных замеров (canvas/webgl/audio/шрифты)
@@ -114,7 +114,7 @@ function COLLECTOR(root){
   // encodeValue / fnv1a / bytesHash are INJECTED here from lib/fp-encode.mjs by
   // the serving routes (probe + collector), so the browser runs the SAME source
   // the unit test imports — no copy to drift (Codex v4.2 #2). The injection point
-  // is INSIDE COLLECTOR so COLLECTOR.toString() carries it into every worker /
+  // is INSIDE COLLECTOR so the artifact renderer carries it into every worker /
   // iframe / OOPIF realm unchanged.
   /*__FP_ENCODE_INJECT__*/
   if(typeof encodeValue==='undefined'){ throw new Error('fp-encode not injected'); }
@@ -122,7 +122,7 @@ function COLLECTOR(root){
   // {path,context,phase,status,valueType,value,error,meta}. Reads the SAME
   // getters as walk() but preserves native types instead of stringifying.
   function walkTyped(rootObj,label,context,phase,recs,maxDepth){
-    var md=maxDepth||MAX_DEPTH, seen=(typeof WeakSet!=='undefined')?new WeakSet():null, n=0;
+    var md=maxDepth||MAX_DEPTH, seen=(typeof WeakSet!=='undefined')?new WeakSet():null, n=0, limitHit=false;
     function push(p,status,enc,error){
       var m={}; if(enc&&enc.special)m.special=enc.special; if(enc&&enc.count!=null)m.count=enc.count;
       recs.push({path:p,context:context,phase:phase,status:status,
@@ -130,7 +130,7 @@ function COLLECTOR(root){
       n++;
     }
     function rec(obj,path,depth){
-      if(n>=MAX_LEAVES) return;
+      if(n>=MAX_LEAVES){ limitHit=true; return; }
       if(obj===null||(typeof obj!=='object'&&typeof obj!=='function')) return;
       if(seen){ if(seen.has(obj)) return; seen.add(obj); }
       var names={};
@@ -155,6 +155,13 @@ function COLLECTOR(root){
       }
     }
     rec(rootObj,label,0);
+    // A silent cap makes a partial graph indistinguishable from a complete one.
+    // Preserve the bounded walk, but make exhaustion an explicit typed failure
+    // so readiness can never certify the truncated snapshot.
+    if(limitHit) recs.push({path:label+'.__walkLimit',context:context,phase:phase,
+      status:STATUS.invalidResult,valueType:null,value:null,
+      error:{name:'WalkLeafLimit',message:'typed walk exceeded '+MAX_LEAVES+' leaves'},
+      meta:{limit:MAX_LEAVES,emitted:n}});
   }
 
   // Current collect() context/phase + the typed record sink. Set at the start of
@@ -177,6 +184,7 @@ function COLLECTOR(root){
     permissionRequired:{__mstatus:STATUS.permissionRequired},
     permissionDenied:{__mstatus:STATUS.permissionDenied},
     blocked:{__mstatus:STATUS.blocked},
+    timeout:{__mstatus:STATUS.timeout},
     invalid:{__mstatus:STATUS.invalidResult},
   };
   // Sync measure: emit a TYPED record AND return the legacy sentinel value so the
@@ -290,36 +298,42 @@ function COLLECTOR(root){
     var px; try{ px=ctx.getImageData(0,0,cv.width,cv.height).data; }catch(e){ return {status:'invalid', err:e}; }
     return {status:'ok', cv:cv, ctx:ctx, px:px};
   }
-  function pixFnv(px){ var s=''; for(var i=0;i<px.length;i+=97) s+=px[i]+','; return hash(s); }
+  function pixFnv(px){ return bytesHash(px); }
   function canvasBlock(){
     return A(function(){
       var first=canvasDraw();
       if(first.status==='unavailable') return {status:M('canvas.status',function(){return MSTATUS.unavailable;})};
       if(first.status==='unsupported') return {status:M('canvas.status',function(){return MSTATUS.unsupported;})};
       if(first.status==='invalid') return {status:M('canvas.status',function(){ throw first.err; })};
-      var px=first.px, cv=first.cv;
-      // 3 internal repeats → stability/variance
-      var fnvs=[pixFnv(px)];
-      for(var rr=0; rr<2; rr++){ var d=canvasDraw(); fnvs.push(d.px?pixFnv(d.px):null); }
-      var stable = fnvs[0]===fnvs[1] && fnvs[1]===fnvs[2];
+      var px=first.px, cv=first.cv, draws=[first];
+      // Three full readbacks. Both digests cover every RGBA byte; a sampled
+      // checksum can miss exactly the pixel mutations this probe is meant to
+      // diagnose. The synchronous SHA implementation also works in opaque and
+      // worker realms where crypto.subtle may be unavailable.
+      for(var rr=0; rr<2; rr++) draws.push(canvasDraw());
+      if(draws.some(function(d){return !d||d.status!=='ok'||!d.px;}))
+        return {status:M('canvas.status',function(){return MSTATUS.invalid;})};
+      var fnvs=draws.map(function(d){return pixFnv(d.px);});
+      var shas=draws.map(function(d){return sha256hex(d.px);});
+      var stable = shas[0]===shas[1] && shas[1]===shas[2];
       var winding=M('canvas.winding',function(){ return first.ctx.isPointInPath(5,5,'evenodd'); });
       var encP;
       if(cv.toDataURL){ var du=S(function(){return cv.toDataURL();}); encP=Promise.resolve((typeof du==='string'&&du.indexOf('data:')===0)?{fmt:'dataURL',len:du.length}:{fmt:'err',len:0}); }
       else if(cv.convertToBlob){ encP=cv.convertToBlob().then(function(b){return {fmt:'blob',len:b.size};},function(){return {fmt:'err',len:0};}); }
       else encP=Promise.resolve({fmt:'none',len:0});
-      return Promise.all([sha256(px), encP]).then(function(r){
+      return encP.then(function(enc){
         M('canvas.width',function(){return cv.width;});
         M('canvas.height',function(){return cv.height;});
         M('canvas.pixelBytes',function(){return px.length;});        // input length
         M('canvas.pixelFnv',function(){return fnvs[0];});
-        M('canvas.pixelSha256',function(){return r[0]||undefined;}); // raw output digest
-        M('canvas.encFmt',function(){return r[1].fmt;});
-        M('canvas.encLen',function(){return r[1].len;});
-        M('canvas.repeats',function(){return fnvs;});                // array of 3 (Codex: repeats)
+        M('canvas.pixelSha256',function(){return shas[0];});         // full RGBA digest
+        M('canvas.encFmt',function(){return enc.fmt;});
+        M('canvas.encLen',function(){return enc.len;});
+        M('canvas.repeats',function(){return shas;});                // three exact SHA-256 readbacks
         M('canvas.stable',function(){return stable;});               // stability/variance
         return { status:'ok', width:cv.width, height:cv.height, winding:winding,
-          pixelBytes:px.length, pixelFnv:fnvs[0], pixelSha256:r[0]||'n/a',
-          encFmt:r[1].fmt, encLen:r[1].len, repeats:fnvs.join(','), stable:String(stable) };
+          pixelBytes:px.length, pixelFnv:fnvs[0], pixelSha256:shas[0],
+          encFmt:enc.fmt, encLen:enc.len, repeats:shas.join(','), stable:String(stable) };
       });
     });
   }
@@ -342,43 +356,96 @@ function COLLECTOR(root){
     'MAX_UNIFORM_BLOCK_SIZE','MAX_UNIFORM_BUFFER_BINDINGS','MAX_VARYING_COMPONENTS',
     'MAX_VERTEX_OUTPUT_COMPONENTS','MAX_VERTEX_UNIFORM_BLOCKS','MAX_VERTEX_UNIFORM_COMPONENTS'];
   // Render a scene and read the pixels back — what the GPU+driver actually
-  // produce, distinct from what getParameter claims. Returns the raw pixels so
-  // the caller can hash them (FNV sync + SHA-256), plus compile/link/gl status.
-  function glRender(gl){
+  // produce, distinct from what getParameter claims. A compile/link/GL failure
+  // is never promoted to `ok`: the status is semantic, not merely "no JS throw".
+  // WebGL2 uses GLSL 300 ES (WebGL1 shaders are not a valid WebGL2 proof), every
+  // byte is synchronously SHA-256 hashed, and every allocated GL object is
+  // released on every exit path.
+  function glRender(gl,isWebGl2){
+    var vs=null,fs=null,pr=null,buf=null,loc=-1;
+    function invalid(stage,message,glError){
+      return {ok:false,status:'invalid-result',stage:stage,error:{name:'WebGLInvalidResult',message:String(message||stage)},
+        compile:(stage.indexOf('compile')>=0?'fail':undefined),link:(stage==='link'?'fail':undefined),glError:glError};
+    }
     try{
-      var vs=gl.createShader(gl.VERTEX_SHADER);
-      gl.shaderSource(vs,'attribute vec2 p;varying vec2 v;void main(){v=p;gl_Position=vec4(p,0.0,1.0);}');
-      gl.compileShader(vs);
-      var vsOk=gl.getShaderParameter(vs,gl.COMPILE_STATUS);
-      var fs=gl.createShader(gl.FRAGMENT_SHADER);
-      gl.shaderSource(fs,'precision highp float;varying vec2 v;void main(){gl_FragColor=vec4(abs(sin(v.x*12.0)),abs(cos(v.y*9.0)),fract(v.x*v.y*7.0),1.0);}');
-      gl.compileShader(fs);
-      var fsOk=gl.getShaderParameter(fs,gl.COMPILE_STATUS);
-      var pr=gl.createProgram(); gl.attachShader(pr,vs); gl.attachShader(pr,fs); gl.linkProgram(pr);
-      var linkOk=gl.getProgramParameter(pr,gl.LINK_STATUS); gl.useProgram(pr);
-      var buf=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+      // Do not attribute a stale caller error to this deterministic render.
+      if(typeof gl.getError==='function'){
+        for(var drain=0;drain<16;drain++){ if(gl.getError()===gl.NO_ERROR) break; }
+      }
+      var vsSource=isWebGl2
+        ?'#version 300 es\nin vec2 p;out vec2 v;void main(){v=p;gl_Position=vec4(p,0.0,1.0);}'
+        :'attribute vec2 p;varying vec2 v;void main(){v=p;gl_Position=vec4(p,0.0,1.0);}';
+      var fsSource=isWebGl2
+        ?'#version 300 es\nprecision highp float;in vec2 v;out vec4 outColor;void main(){outColor=vec4(abs(sin(v.x*12.0)),abs(cos(v.y*9.0)),fract(v.x*v.y*7.0),1.0);}'
+        :'precision highp float;varying vec2 v;void main(){gl_FragColor=vec4(abs(sin(v.x*12.0)),abs(cos(v.y*9.0)),fract(v.x*v.y*7.0),1.0);}';
+      vs=gl.createShader(gl.VERTEX_SHADER);
+      if(!vs) return invalid('vertex-create','createShader returned null');
+      gl.shaderSource(vs,vsSource); gl.compileShader(vs);
+      if(!gl.getShaderParameter(vs,gl.COMPILE_STATUS))
+        return invalid('vertex-compile',gl.getShaderInfoLog&&gl.getShaderInfoLog(vs));
+      fs=gl.createShader(gl.FRAGMENT_SHADER);
+      if(!fs) return invalid('fragment-create','createShader returned null');
+      gl.shaderSource(fs,fsSource); gl.compileShader(fs);
+      if(!gl.getShaderParameter(fs,gl.COMPILE_STATUS))
+        return invalid('fragment-compile',gl.getShaderInfoLog&&gl.getShaderInfoLog(fs));
+      pr=gl.createProgram();
+      if(!pr) return invalid('program-create','createProgram returned null');
+      gl.attachShader(pr,vs); gl.attachShader(pr,fs); gl.linkProgram(pr);
+      if(!gl.getProgramParameter(pr,gl.LINK_STATUS))
+        return invalid('link',gl.getProgramInfoLog&&gl.getProgramInfoLog(pr));
+      gl.useProgram(pr);
+      buf=gl.createBuffer();
+      if(!buf) return invalid('buffer-create','createBuffer returned null');
+      gl.bindBuffer(gl.ARRAY_BUFFER,buf);
       gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
-      var loc=gl.getAttribLocation(pr,'p'); gl.enableVertexAttribArray(loc);
+      loc=gl.getAttribLocation(pr,'p');
+      if(loc<0) return invalid('attribute','attribute p was not linked');
+      gl.enableVertexAttribArray(loc);
       gl.vertexAttribPointer(loc,2,gl.FLOAT,false,0,0);
       gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
       var w=gl.drawingBufferWidth,h=gl.drawingBufferHeight;
-      var px=new Uint8Array(w*h*4); gl.readPixels(0,0,w,h,gl.RGBA,gl.UNSIGNED_BYTE,px);
-      return { ok:true, w:w, h:h, px:px, compile:(vsOk&&fsOk?'ok':'fail'), link:(linkOk?'ok':'fail'), glError:gl.getError() };
-    }catch(e){ return { ok:false, error:'ERR:'+e.name }; }
+      if(!Number.isFinite(w)||!Number.isFinite(h)||w<=0||h<=0||w*h>16777216)
+        return invalid('dimensions','invalid drawing buffer dimensions');
+      var px=new Uint8Array(w*h*4);
+      gl.readPixels(0,0,w,h,gl.RGBA,gl.UNSIGNED_BYTE,px);
+      var glError=gl.getError();
+      if(glError!==gl.NO_ERROR) return invalid('gl-error','getError returned '+glError,glError);
+      if(gl.isContextLost&&gl.isContextLost()) return invalid('context-lost','WebGL context was lost');
+      return {ok:true,status:'ok',w:w,h:h,px:px,compile:true,link:true,glError:gl.NO_ERROR,
+        sha256:sha256hex(px)};
+    }catch(e){
+      return {ok:false,status:'error',stage:'exception',error:{name:e&&e.name||'Error',message:e&&e.message||String(e)}};
+    }finally{
+      try{ if(loc>=0&&gl.disableVertexAttribArray) gl.disableVertexAttribArray(loc); }catch(_){}
+      try{ if(gl.bindBuffer) gl.bindBuffer(gl.ARRAY_BUFFER,null); }catch(_){}
+      try{ if(gl.useProgram) gl.useProgram(null); }catch(_){}
+      try{ if(buf&&gl.deleteBuffer) gl.deleteBuffer(buf); }catch(_){}
+      try{ if(pr&&gl.deleteProgram) gl.deleteProgram(pr); }catch(_){}
+      try{ if(fs&&gl.deleteShader) gl.deleteShader(fs); }catch(_){}
+      try{ if(vs&&gl.deleteShader) gl.deleteShader(vs); }catch(_){}
+    }
   }
   function glContext(name){
     var cv=makeCanvas(64,64); if(!cv||!cv.getContext) return null;
     try{ return cv.getContext(name); }catch(e){ return null; }
   }
-  function glFnv(px,w,h){ var s=''; for(var i=0;i<px.length;i+=131) s+=px[i]; return hash(s+'|'+w+'x'+h); }
+  function glFnv(px,w,h){ var s=''; for(var i=0;i<px.length;i++) s+=String.fromCharCode(px[i]); return hash(s+'|'+w+'x'+h); }
+  function emitWebGlStatus(path,result){
+    if(result&&result.status==='ok') return M(path,function(){return 'ok';});
+    var st=result&&result.status==='invalid-result'?STATUS.invalidResult:STATUS.error;
+    var er=result&&result.error?result.error:{name:'WebGLProbeError',message:'render did not return a typed result'};
+    pushRec(path,st,null,er,0);
+    return result&&result.status||'error';
+  }
   function glBlock(){
     return A(function(){
-      var out={}, jobs=[];
+      var out={};
       // A FRESH canvas per context type — one canvas can't hand out both webgl
       // and webgl2, which is why webgl1 used to come back "n/a".
       ['webgl2','webgl'].forEach(function(name){
         var gl=glContext(name);
         if(!gl){ out[name]={status:M('webgl.'+name+'.status',function(){return MSTATUS.unsupported;})}; return; }
+        M('webgl.'+name+'.status',function(){return 'ok';});
         var dbg=null; try{ dbg=gl.getExtension('WEBGL_debug_renderer_info'); }catch(e){}
         var g={};
         GL_PARAMS.forEach(function(k){ if(gl[k]!==undefined) g[k]=M('webgl.'+name+'.params.'+k,function(){ var v=gl.getParameter(gl[k]); return (v&&v.length!==undefined&&typeof v!=='string')?Array.prototype.slice.call(v).join(','):v; }); });
@@ -388,144 +455,307 @@ function COLLECTOR(root){
             prec[st+'.'+pt]=M('webgl.'+name+'.precision.'+st+'.'+pt,function(){ var r=gl.getShaderPrecisionFormat(gl[st],gl[pt]); return r.rangeMin+','+r.rangeMax+','+r.precision; });
           });
         });
-        // 3 render repeats → stability (P3)
-        var r=glRender(gl), renderFnvs=[];
-        if(r.ok){ renderFnvs.push(glFnv(r.px,r.w,r.h)); for(var rr=0;rr<2;rr++){ var r2=glRender(gl); renderFnvs.push(r2.ok?glFnv(r2.px,r2.w,r2.h):null); } }
-        var stable = r.ok && renderFnvs[0]===renderFnvs[1] && renderFnvs[1]===renderFnvs[2];
-        M('webgl.'+name+'.render.fnv',function(){return r.ok?renderFnvs[0]:undefined;});
-        M('webgl.'+name+'.render.compile',function(){return r.ok?r.compile:undefined;});
-        M('webgl.'+name+'.render.link',function(){return r.ok?r.link:undefined;});
-        M('webgl.'+name+'.render.glError',function(){return r.ok?r.glError:undefined;});
-        M('webgl.'+name+'.render.pixelBytes',function(){return r.ok?r.px.length:undefined;});
-        M('webgl.'+name+'.render.stable',function(){return stable;});
-        M('webgl.'+name+'.render.repeats',function(){return renderFnvs;});
-        if(!r.ok) M('webgl.'+name+'.render.error',function(){return r.error;});
+        // Three independent render passes, each with strict semantic validation
+        // and an exact full-pixel SHA-256. A single bad repeat fails the render.
+        var renders=[];
+        for(var rr=0;rr<3;rr++) renders.push(glRender(gl,name==='webgl2'));
+        var r=renders[0], failed=null;
+        for(var ri=0;ri<renders.length;ri++){ if(!renders[ri].ok){ failed=renders[ri]; break; } }
+        var renderFnvs=renders.map(function(x){return x.ok?glFnv(x.px,x.w,x.h):null;});
+        var renderShas=renders.map(function(x){return x.ok?x.sha256:null;});
+        var stable=!failed&&renderShas[0]===renderShas[1]&&renderShas[1]===renderShas[2];
+        emitWebGlStatus('webgl.'+name+'.render.status',failed||r);
+        if(!failed){
+          M('webgl.'+name+'.render.fnv',function(){return renderFnvs[0];});
+          M('webgl.'+name+'.render.sha256',function(){return renderShas[0];});
+          M('webgl.'+name+'.render.compile',function(){return r.compile;});
+          M('webgl.'+name+'.render.link',function(){return r.link;});
+          M('webgl.'+name+'.render.glError',function(){return r.glError;});
+          M('webgl.'+name+'.render.width',function(){return r.w;});
+          M('webgl.'+name+'.render.height',function(){return r.h;});
+          M('webgl.'+name+'.render.pixelBytes',function(){return r.px.length;});
+          M('webgl.'+name+'.render.stable',function(){return stable;});
+          M('webgl.'+name+'.render.repeats',function(){return renderShas;});
+          M('webgl.'+name+'.render.sha256Repeats',function(){return renderShas;});
+          M('webgl.'+name+'.render.fnvRepeats',function(){return renderFnvs;});
+        }
         var entry={
-          status:'ok',
+          status:failed?failed.status:'ok',
           unmaskedVendor: M('webgl.'+name+'.unmaskedVendor',function(){return dbg?gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL):MSTATUS.unavailable;}),
           unmaskedRenderer: M('webgl.'+name+'.unmaskedRenderer',function(){return dbg?gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL):MSTATUS.unavailable;}),
           params: g, precision: prec,
-          render: r.ok?{w:r.w,h:r.h,fnv:renderFnvs[0],compile:r.compile,link:r.link,glError:r.glError,stable:String(stable),repeats:renderFnvs.join(',')}:{error:r.error},
+          render: !failed?{status:'ok',w:r.w,h:r.h,fnv:renderFnvs[0],sha256:renderShas[0],compile:r.compile,link:r.link,
+            glError:r.glError,stable:String(stable),repeats:renderShas.join(','),fnvRepeats:renderFnvs.join(',')}
+            :{status:failed.status,stage:failed.stage,error:failed.error,glError:failed.glError},
           extensions: M('webgl.'+name+'.extensions',function(){ return (gl.getSupportedExtensions()||[]).sort().join(','); }),
           contextAttrs: M('webgl.'+name+'.contextAttrs',function(){ return JSON.stringify(gl.getContextAttributes()); }),
         };
         out[name]=entry;
-        if(r.ok) jobs.push(sha256(r.px).then(function(hx){ entry.render.sha256=hx||'n/a'; M('webgl.'+name+'.render.sha256',function(){return hx||undefined;}); }));
       });
-      return Promise.all(jobs).then(function(){ return out; });
+      return out;
     });
   }
 
   /* ---- WebGPU ---------------------------------------------------------- */
+  // A cancellation-safe ownership scope. `close()` is idempotent; resources
+  // acquired after a timeout are closed immediately instead of leaking from a
+  // promise that settled after the caller's Promise.race.
+  function gpuResourceScope(){
+    var entries=[],closed=false;
+    function closeEntry(entry){
+      if(!entry||entry.closed) return;
+      entry.closed=true;
+      try{ entry.close(entry.value); }catch(_){}
+    }
+    return {
+      own:function(value,close){
+        if(!value) return value;
+        var entry={value:value,close:close||function(){},closed:false};
+        if(closed) closeEntry(entry); else entries.push(entry);
+        return value;
+      },
+      close:function(){
+        if(closed) return;
+        closed=true;
+        for(var i=entries.length-1;i>=0;i--) closeEntry(entries[i]);
+        entries.length=0;
+      },
+      isClosed:function(){return closed;}
+    };
+  }
+
+  function gpuError(error,fallbackName){
+    return {name:error&&error.name||fallbackName||'WebGPUError',message:error&&error.message||String(error||fallbackName||'WebGPU error')};
+  }
+
+  // Race an operation without ever calling M()/pushRec from the losing branch.
+  // The operation owns its cleanup callback; timeout cancels it once. The late
+  // promise remains observed, so it cannot cause an unhandled rejection/write.
+  function raceGpuTask(task,timeoutMs){
+    var op=task&&task.promise?task:{promise:task,cancel:function(){}};
+    return new Promise(function(resolve){
+      var settled=false;
+      var timer=setTimeout(function(){
+        if(settled) return;
+        settled=true;
+        try{ if(op.cancel) op.cancel(); }catch(_){}
+        resolve({kind:'timeout'});
+      },timeoutMs);
+      Promise.resolve(op.promise).then(function(value){
+        if(settled) return;
+        settled=true; clearTimeout(timer); resolve({kind:'fulfilled',value:value});
+      },function(error){
+        if(settled) return;
+        settled=true; clearTimeout(timer); resolve({kind:'rejected',error:error});
+      });
+    });
+  }
+
+  function gpuResultFromRace(race,label){
+    if(!race||race.kind==='timeout') return {status:'timeout',error:{name:'TimeoutError',message:label+' timed out'}};
+    if(race.kind==='rejected') return {status:'error',error:gpuError(race.error,label+'Error')};
+    var value=race.value;
+    if(!value||['ok','timeout','error','invalid-result','unavailable','unsupported','blocked'].indexOf(value.status)<0)
+      return {status:'invalid-result',error:{name:'WebGPUInvalidResult',message:label+' returned no recognised status'}};
+    return value;
+  }
+
+  // Exact full-byte digest; no sampling, string rounding, or FNV substitution.
+  function gpuBytesResult(bytes,extra){
+    if(!bytes||typeof bytes.length!=='number'||bytes.length<=0)
+      return {status:'invalid-result',error:{name:'WebGPUInvalidResult',message:'empty GPU readback'}};
+    var digest=sha256hex(bytes);
+    var result={status:'ok',hash:digest,sha256:digest,hashAlgorithm:'sha256',byteLength:bytes.length};
+    Object.keys(extra||{}).forEach(function(k){result[k]=extra[k];});
+    return result;
+  }
+
+  function gpuCompilation(mod){
+    return Promise.resolve(mod&&mod.getCompilationInfo?mod.getCompilationInfo():null).then(function(info){
+      var messages=info&&info.messages?Array.from(info.messages):[];
+      var errors=messages.filter(function(m){return m&&m.type==='error';});
+      return {messageCount:messages.length,errorCount:errors.length};
+    });
+  }
+
+  function createGpuComputeOperation(adapter){
+    var scope=gpuResourceScope(),mapped=false,read=null;
+    function cancelled(){return {status:'timeout',error:{name:'TimeoutError',message:'WebGPU compute cancelled'}};}
+    var promise=Promise.resolve().then(function(){
+      if(!adapter||typeof adapter.requestDevice!=='function')
+        return {status:'unavailable',error:{name:'WebGPUUnavailable',message:'requestDevice is unavailable'}};
+      return adapter.requestDevice();
+    }).then(function(dev){
+      if(dev&&dev.status) return dev;
+      if(!dev) return {status:'unavailable',error:{name:'WebGPUUnavailable',message:'requestDevice returned null'}};
+      scope.own(dev,function(x){if(x.destroy)x.destroy();});
+      if(scope.isClosed()) return cancelled();
+      var lost=false;
+      try{ if(dev.lost&&dev.lost.then) dev.lost.then(function(){lost=true;},function(){lost=true;}); }catch(_){}
+      var N=64,bytes=N*4,wgsl=
+        '@group(0) @binding(0) var<storage, read_write> data: array<f32>;'
+        +'@compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id: vec3<u32>){'
+        +'let i=id.x; data[i]=sin(f32(i)*0.1)+cos(f32(i)*0.033)+tanh(f32(i)*0.005);}';
+      var mod=dev.createShaderModule({code:wgsl});
+      var pipe=dev.createComputePipeline({layout:'auto',compute:{module:mod,entryPoint:'main'}});
+      var buf=scope.own(dev.createBuffer({size:bytes,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC}),
+        function(x){if(x.destroy)x.destroy();});
+      read=scope.own(dev.createBuffer({size:bytes,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ}),
+        function(x){try{if(mapped&&x.unmap)x.unmap();}catch(_){} mapped=false; if(x.destroy)x.destroy();});
+      if(scope.isClosed()) return cancelled();
+      if(!buf||!read) return {status:'invalid-result',error:{name:'WebGPUInvalidResult',message:'createBuffer returned null'}};
+      var bg=dev.createBindGroup({layout:pipe.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:buf}}]});
+      var enc=dev.createCommandEncoder(),pass=enc.beginComputePass();
+      pass.setPipeline(pipe); pass.setBindGroup(0,bg); pass.dispatchWorkgroups(N); pass.end();
+      enc.copyBufferToBuffer(buf,0,read,0,bytes); dev.queue.submit([enc.finish()]);
+      return Promise.resolve(read.mapAsync(GPUMapMode.READ)).then(function(){
+        mapped=true;
+        if(scope.isClosed()){
+          try{read.unmap();}catch(_){} mapped=false; return cancelled();
+        }
+        var exact=new Uint8Array(read.getMappedRange()).slice();
+        try{read.unmap();}catch(_){} mapped=false;
+        if(exact.length!==bytes)
+          return {status:'invalid-result',error:{name:'WebGPUInvalidResult',message:'compute readback length mismatch'}};
+        var values=new Float32Array(exact.buffer,exact.byteOffset,N),finite=true;
+        for(var i=0;i<values.length;i++){if(!Number.isFinite(values[i])){finite=false;break;}}
+        if(!finite) return {status:'invalid-result',error:{name:'WebGPUInvalidResult',message:'compute output contains a non-finite value'}};
+        return gpuCompilation(mod).then(function(compilation){
+          if(compilation.errorCount>0)
+            return {status:'invalid-result',error:{name:'WebGPUCompilationError',message:'compute shader reported compilation errors'},
+              compilationMessages:compilation.messageCount,compilationErrors:compilation.errorCount};
+          if(lost) return {status:'invalid-result',error:{name:'WebGPUDeviceLost',message:'device was lost before compute readback'}};
+          return gpuBytesResult(exact,{valueCount:N,compilationMessages:compilation.messageCount,
+            compilationErrors:compilation.errorCount,deviceLost:false});
+        });
+      });
+    });
+    promise=promise.then(function(result){scope.close();return result;},function(error){scope.close();return {status:'error',error:gpuError(error,'WebGPUComputeError')};});
+    return {promise:promise,cancel:function(){scope.close();}};
+  }
+
+  function createGpuRenderOperation(gpu){
+    var scope=gpuResourceScope(),mapped=false,read=null;
+    function cancelled(){return {status:'timeout',error:{name:'TimeoutError',message:'WebGPU render cancelled'}};}
+    var promise=Promise.resolve().then(function(){
+      if(!gpu||typeof gpu.requestAdapter!=='function') return null;
+      return gpu.requestAdapter();
+    }).then(function(adapter){
+      if(!adapter) return {status:'unavailable',error:{name:'WebGPUUnavailable',message:'render adapter unavailable'}};
+      if(scope.isClosed()) return cancelled();
+      return adapter.requestDevice();
+    }).then(function(dev){
+      if(dev&&dev.status) return dev;
+      if(!dev) return {status:'unavailable',error:{name:'WebGPUUnavailable',message:'render device unavailable'}};
+      scope.own(dev,function(x){if(x.destroy)x.destroy();});
+      if(scope.isClosed()) return cancelled();
+      var lost=false;
+      try{if(dev.lost&&dev.lost.then)dev.lost.then(function(){lost=true;},function(){lost=true;});}catch(_){}
+      var W=64,wgsl=
+        '@vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{'
+        +'var p=array<vec2f,3>(vec2f(-1.,-1.),vec2f(3.,-1.),vec2f(-1.,3.));return vec4f(p[i],0.,1.);}'
+        +'@fragment fn fs(@builtin(position) c:vec4f)->@location(0) vec4f{'
+        +'let u=c.xy/64.;let n=fract(sin(u.x*12.9898+u.y*78.233)*43758.5453);return vec4f(n,u.x,u.y,1.);}';
+      var mod=dev.createShaderModule({code:wgsl});
+      var pipe=dev.createRenderPipeline({layout:'auto',vertex:{module:mod,entryPoint:'vs'},
+        fragment:{module:mod,entryPoint:'fs',targets:[{format:'rgba8unorm'}]},primitive:{topology:'triangle-list'}});
+      var tex=scope.own(dev.createTexture({size:[W,W],format:'rgba8unorm',
+        usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.COPY_SRC}),function(x){if(x.destroy)x.destroy();});
+      var bpr=W*4,expectedBytes=bpr*W;
+      read=scope.own(dev.createBuffer({size:expectedBytes,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ}),
+        function(x){try{if(mapped&&x.unmap)x.unmap();}catch(_){} mapped=false;if(x.destroy)x.destroy();});
+      if(scope.isClosed()) return cancelled();
+      if(!tex||!read) return {status:'invalid-result',error:{name:'WebGPUInvalidResult',message:'render allocation returned null'}};
+      var enc=dev.createCommandEncoder();
+      var rp=enc.beginRenderPass({colorAttachments:[{view:tex.createView(),clearValue:{r:0,g:0,b:0,a:1},loadOp:'clear',storeOp:'store'}]});
+      rp.setPipeline(pipe);rp.draw(3);rp.end();
+      enc.copyTextureToBuffer({texture:tex},{buffer:read,bytesPerRow:bpr,rowsPerImage:W},[W,W,1]);
+      dev.queue.submit([enc.finish()]);
+      return Promise.resolve(read.mapAsync(GPUMapMode.READ)).then(function(){
+        mapped=true;
+        if(scope.isClosed()){
+          try{read.unmap();}catch(_){} mapped=false;return cancelled();
+        }
+        var exact=new Uint8Array(read.getMappedRange()).slice();
+        try{read.unmap();}catch(_){} mapped=false;
+        if(exact.length!==expectedBytes)
+          return {status:'invalid-result',error:{name:'WebGPUInvalidResult',message:'render readback length mismatch'}};
+        return gpuCompilation(mod).then(function(compilation){
+          if(compilation.errorCount>0)
+            return {status:'invalid-result',error:{name:'WebGPUCompilationError',message:'render shader reported compilation errors'},
+              compilationMessages:compilation.messageCount,compilationErrors:compilation.errorCount};
+          if(lost) return {status:'invalid-result',error:{name:'WebGPUDeviceLost',message:'device was lost before render readback'}};
+          return gpuBytesResult(exact,{width:W,height:W,bytesPerRow:bpr,pixelBytes:exact.length,
+            compilationMessages:compilation.messageCount,compilationErrors:compilation.errorCount,deviceLost:false});
+        });
+      });
+    });
+    promise=promise.then(function(result){scope.close();return result;},function(error){scope.close();return {status:'error',error:gpuError(error,'WebGPURenderError')};});
+    return {promise:promise,cancel:function(){scope.close();}};
+  }
+
+  function emitGpuStatus(path,result){
+    if(result&&result.status==='ok') return M(path,function(){return 'ok';});
+    var map={timeout:STATUS.timeout,error:STATUS.error,'invalid-result':STATUS.invalidResult,
+      unavailable:STATUS.unavailableInContext,unsupported:STATUS.unsupported,blocked:STATUS.blocked};
+    var status=map[result&&result.status]||STATUS.invalidResult;
+    var error=result&&result.error?result.error:{name:'WebGPUInvalidResult',message:'missing typed WebGPU outcome'};
+    pushRec(path,status,null,error,0);
+    return result&&result.status||'invalid-result';
+  }
+
+  function emitGpuMeasurements(prefix,result){
+    emitGpuStatus(prefix+'.status',result);
+    if(!result||result.status!=='ok') return;
+    ['hash','sha256','hashAlgorithm','byteLength','valueCount','pixelBytes','width','height','bytesPerRow',
+      'compilationMessages','compilationErrors','deviceLost'].forEach(function(key){
+      if(Object.prototype.hasOwnProperty.call(result,key)) M(prefix+'.'+key,function(){return result[key];});
+    });
+  }
+
   function gpuBlock(){
     return A(function(){
       var gp=root.navigator&&root.navigator.gpu;
       if(!gp) return {available:M('webgpu.available',function(){return MSTATUS.unsupported;})};
-      // Real GPU compute (Codex P3): a WGSL compute shader writes a deterministic
-      // f32 pattern to a storage buffer, read back + hashed → what the GPU+driver
-      // actually COMPUTE, plus shader compile messages. Best-effort, 6s timeout.
-      function computeProbe(ad){
-        return Promise.resolve(ad.requestDevice()).then(function(dev){
-          if(!dev) return { status:'no-device' };
-          var N=64, wgsl=
-            '@group(0) @binding(0) var<storage, read_write> data: array<f32>;'
-            +'@compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id: vec3<u32>){'
-            +'let i=id.x; data[i]=sin(f32(i)*0.1)+cos(f32(i)*0.033)+tanh(f32(i)*0.005);}';
-          var mod=dev.createShaderModule({code:wgsl});
-          var pipe=dev.createComputePipeline({layout:'auto',compute:{module:mod,entryPoint:'main'}});
-          var bytes=N*4;
-          var buf=dev.createBuffer({size:bytes,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC});
-          var read=dev.createBuffer({size:bytes,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
-          var bg=dev.createBindGroup({layout:pipe.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:buf}}]});
-          var enc=dev.createCommandEncoder(); var pass=enc.beginComputePass();
-          pass.setPipeline(pipe); pass.setBindGroup(0,bg); pass.dispatchWorkgroups(N); pass.end();
-          enc.copyBufferToBuffer(buf,0,read,0,bytes); dev.queue.submit([enc.finish()]);
-          return read.mapAsync(GPUMapMode.READ).then(function(){
-            var arr=new Float32Array(read.getMappedRange().slice(0)); read.unmap();
-            var s=''; for(var i=0;i<arr.length;i++) s+=Math.round(arr[i]*1e6)/1e6+',';
-            return Promise.resolve(mod.getCompilationInfo?mod.getCompilationInfo():null).then(function(ci){
-              M('webgpu.compute.hash',function(){return hash(s);});
-              M('webgpu.compute.len',function(){return arr.length;});
-              M('webgpu.compute.compileMessages',function(){return ci&&ci.messages?ci.messages.length:0;});
-              try{ dev.destroy&&dev.destroy(); }catch(_){}
-              return { status:'ok', hash:hash(s), len:arr.length };
-            });
-          });
-        });
-      }
-      // Real GPU RENDER pass (Codex v4.2 #15): render a deterministic pattern to a
-      // 64×64 rgba8 texture (row = 64*4 = 256 B, the copy alignment), read the
-      // pixels back and hash them — exercises the RENDER pipeline (rasteriser +
-      // fragment stage), distinct from compute. Uses its OWN adapter+device so it
-      // is fully isolated from the compute probe; watches device-lost.
-      function renderProbe(gp2){
-        return Promise.resolve(gp2.requestAdapter&&gp2.requestAdapter()).then(function(ad2){
-          if(!ad2) return { status:'no-adapter' };
-          return Promise.resolve(ad2.requestDevice()).then(function(dev){
-            if(!dev) return { status:'no-device' };
-            var lost=false; try{ if(dev.lost&&dev.lost.then) dev.lost.then(function(){lost=true;}); }catch(_){}
-            var W=64, wgsl=
-              '@vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{'
-              +'var p=array<vec2f,3>(vec2f(-1.,-1.),vec2f(3.,-1.),vec2f(-1.,3.));return vec4f(p[i],0.,1.);}'
-              +'@fragment fn fs(@builtin(position) c:vec4f)->@location(0) vec4f{'
-              +'let u=c.xy/64.;let n=fract(sin(u.x*12.9898+u.y*78.233)*43758.5453);return vec4f(n,u.x,u.y,1.);}';
-            var mod=dev.createShaderModule({code:wgsl});
-            var pipe=dev.createRenderPipeline({layout:'auto',vertex:{module:mod,entryPoint:'vs'},fragment:{module:mod,entryPoint:'fs',targets:[{format:'rgba8unorm'}]},primitive:{topology:'triangle-list'}});
-            var tex=dev.createTexture({size:[W,W],format:'rgba8unorm',usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.COPY_SRC});
-            var bpr=W*4, readBuf=dev.createBuffer({size:bpr*W,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
-            var enc=dev.createCommandEncoder();
-            var rp=enc.beginRenderPass({colorAttachments:[{view:tex.createView(),clearValue:{r:0,g:0,b:0,a:1},loadOp:'clear',storeOp:'store'}]});
-            rp.setPipeline(pipe); rp.draw(3); rp.end();
-            enc.copyTextureToBuffer({texture:tex},{buffer:readBuf,bytesPerRow:bpr,rowsPerImage:W},[W,W,1]);
-            dev.queue.submit([enc.finish()]);
-            return readBuf.mapAsync(GPUMapMode.READ).then(function(){
-              var px=new Uint8Array(readBuf.getMappedRange().slice(0)); readBuf.unmap();
-              var s=''; for(var i=0;i<px.length;i+=97) s+=px[i]+',';   // sample → compact stable string
-              return Promise.resolve(mod.getCompilationInfo?mod.getCompilationInfo():null).then(function(ci){
-                M('webgpu.render.hash',function(){return hash(s);});
-                M('webgpu.render.pixelBytes',function(){return px.length;});
-                M('webgpu.render.compileMessages',function(){return ci&&ci.messages?ci.messages.length:0;});
-                M('webgpu.render.deviceLost',function(){return lost;});
-                try{ dev.destroy&&dev.destroy(); }catch(_){}
-                return { status:'ok', hash:hash(s) };
-              });
-            });
-          });
-        });
-      }
-      // requestAdapter() itself has NO timeout in the spec, and in a subframe/
-      // OOPIF where WebGPU is disabled by Permissions-Policy it can return a
-      // promise that NEVER settles — which used to hang the whole realm's
-      // Promise.all past its harness timeout. Race it: a non-settling adapter
-      // request resolves to blocked (policy) instead of hanging the realm.
-      var adReq; try{ adReq=gp.requestAdapter&&gp.requestAdapter(); }catch(e){ adReq=null; }
-      var adRace=new Promise(function(res){ setTimeout(function(){ res('__adapter-timeout'); },5000); });
-      return Promise.race([Promise.resolve(adReq),adRace]).then(function(ad){
-        if(ad==='__adapter-timeout') return {status:M('webgpu.status',function(){return MSTATUS.blocked;})};
-        if(!ad) return {status:M('webgpu.status',function(){return MSTATUS.unavailable;})};
+      M('webgpu.available',function(){return true;});
+      var adapterTask={promise:Promise.resolve().then(function(){
+        if(typeof gp.requestAdapter!=='function') return null;
+        return gp.requestAdapter();
+      }),cancel:function(){}};
+      return raceGpuTask(adapterTask,5000).then(function(adapterRace){
+        var adapterResult;
+        if(adapterRace.kind==='timeout') adapterResult={status:'timeout',error:{name:'TimeoutError',message:'requestAdapter timed out'}};
+        else if(adapterRace.kind==='rejected') adapterResult={status:'error',error:gpuError(adapterRace.error,'WebGPUAdapterError')};
+        else if(!adapterRace.value) adapterResult={status:'unavailable',error:{name:'WebGPUUnavailable',message:'requestAdapter returned null'}};
+        else adapterResult={status:'ok'};
+        emitGpuStatus('webgpu.status',adapterResult);
+        if(adapterResult.status!=='ok') return {status:adapterResult.status,error:adapterResult.error};
+        var ad=adapterRace.value;
         var info=ad.info||{};
         var lim={}; try{ for(var k in ad.limits){ lim[k]=M('webgpu.limits.'+k,(function(kk){return function(){return ad.limits[kk];};})(k)); } }catch(e){}
         var base={
           status:'ok',
           features:M('webgpu.features',function(){ return Array.from(ad.features||[]).sort().join(','); }),
           limits:lim,
-          // isFallbackAdapter was removed from the WebGPU spec → genuinely undefined.
-          isFallback:M('webgpu.isFallback',function(){return ad.isFallbackAdapter;}),
-          vendor:M('webgpu.vendor',function(){return info.vendor;}),
-          architecture:M('webgpu.architecture',function(){return info.architecture;}),
-          device:M('webgpu.device',function(){return info.device;}),
-          description:M('webgpu.description',function(){return info.description;}),
-          wgslFeatures:M('webgpu.wgslFeatures',function(){ return gp.wgslLanguageFeatures?Array.from(gp.wgslLanguageFeatures).sort().join(','):undefined; }),
-          preferredFormat:M('webgpu.preferredFormat',function(){return gp.getPreferredCanvasFormat&&gp.getPreferredCanvasFormat();}),
+          // Removed/missing optional fields are explicit unavailable statuses,
+          // not successful `undefined` measurements.
+          isFallback:M('webgpu.isFallback',function(){return typeof ad.isFallbackAdapter==='undefined'?MSTATUS.unavailable:ad.isFallbackAdapter;}),
+          vendor:M('webgpu.vendor',function(){return typeof info.vendor==='undefined'?MSTATUS.unavailable:info.vendor;}),
+          architecture:M('webgpu.architecture',function(){return typeof info.architecture==='undefined'?MSTATUS.unavailable:info.architecture;}),
+          device:M('webgpu.device',function(){return typeof info.device==='undefined'?MSTATUS.unavailable:info.device;}),
+          description:M('webgpu.description',function(){return typeof info.description==='undefined'?MSTATUS.unavailable:info.description;}),
+          wgslFeatures:M('webgpu.wgslFeatures',function(){return gp.wgslLanguageFeatures?Array.from(gp.wgslLanguageFeatures).sort().join(','):MSTATUS.unavailable;}),
+          preferredFormat:M('webgpu.preferredFormat',function(){return gp.getPreferredCanvasFormat?gp.getPreferredCanvasFormat():MSTATUS.unavailable;}),
         };
-        var timeout=new Promise(function(_,rej){ setTimeout(function(){rej(new Error('timeout'));},6000); });
-        return Promise.race([computeProbe(ad),timeout]).then(function(cp){ base.compute=cp; M('webgpu.compute.status',function(){return cp&&cp.status;}); },
-          function(e){ base.compute={status:'error'}; M('webgpu.compute.status',function(){ throw e; }); }).then(function(){
-          // RENDER pass — own adapter/device + own timeout, fully isolated so it
-          // can never disturb the compute result above (Codex v4.2 #15).
-          var rTimeout=new Promise(function(res){ setTimeout(function(){res({status:'timeout'});},6000); });
-          return Promise.race([renderProbe(gp),rTimeout]).then(function(rp){ base.render=rp; M('webgpu.render.status',function(){return rp&&rp.status;}); return base; },
-            function(){ base.render={status:'error'}; M('webgpu.render.status',function(){return 'error';}); return base; });
+        return raceGpuTask(createGpuComputeOperation(ad),6000).then(function(computeRace){
+          var cp=gpuResultFromRace(computeRace,'WebGPU compute');
+          base.compute=cp;emitGpuMeasurements('webgpu.compute',cp);
+          // Render has an isolated adapter/device and ownership scope so a
+          // failure cannot corrupt the successful compute evidence.
+          return raceGpuTask(createGpuRenderOperation(gp),6000).then(function(renderRace){
+            var rp=gpuResultFromRace(renderRace,'WebGPU render');
+            base.render=rp;emitGpuMeasurements('webgpu.render',rp);return base;
+          });
         });
       });
     });
@@ -537,20 +767,44 @@ function COLLECTOR(root){
     return new Promise(function(res){
       var OAC=root.OfflineAudioContext||root.webkitOfflineAudioContext;
       if(!OAC){ res(null); return; }
-      var ctx=new OAC(1,5000,44100);
-      var osc=ctx.createOscillator(); osc.type='triangle'; osc.frequency.value=10000;
-      var comp=ctx.createDynamicsCompressor();
-      [['threshold',-50],['knee',40],['ratio',12],['attack',0],['release',0.25]].forEach(function(kv){
-        try{ comp[kv[0]].value=kv[1]; }catch(e){}
-      });
-      osc.connect(comp); comp.connect(ctx.destination); osc.start(0);
-      ctx.oncomplete=function(e){
-        var buf=e.renderedBuffer.getChannelData(0), sum=0;
-        for(var i=0;i<buf.length;i++) sum+=Math.abs(buf[i]);
-        res({ sum:sum, hash:hash(Array.prototype.slice.call(buf,4000,4200).join(',')), sampleRate:ctx.sampleRate, bufLen:buf.length });
-      };
-      ctx.startRendering();
-      setTimeout(function(){res({timeout:true});},4000);
+      var settled=false,timer=null,ctx=null;
+      function done(v){ if(settled)return; settled=true; if(timer!==null)clearTimeout(timer); res(v); }
+      function digest(renderedBuffer){
+        try{
+          var samples=renderedBuffer.getChannelData(0), sum=0;
+          // Canonical little-endian Float32 bytes make the digest independent of
+          // JS number stringification and cover the complete DSP output.
+          var bytes=new Uint8Array(samples.length*4), view=new DataView(bytes.buffer);
+          for(var i=0;i<samples.length;i++){ sum+=Math.abs(samples[i]); view.setFloat32(i*4,samples[i],true); }
+          done({sum:sum,sha256:sha256hex(bytes),fnv:bytesHash(bytes),sampleRate:ctx.sampleRate,
+            sampleCount:samples.length,byteLength:bytes.length});
+        }catch(e){ done({error:e}); }
+      }
+      try{
+        ctx=new OAC(1,5000,44100);
+        var osc=ctx.createOscillator(); osc.type='triangle'; osc.frequency.value=10000;
+        var comp=ctx.createDynamicsCompressor();
+        [['threshold',-50],['knee',40],['ratio',12],['attack',0],['release',0.25]].forEach(function(kv){
+          try{ comp[kv[0]].value=kv[1]; }catch(e){}
+        });
+        osc.connect(comp); comp.connect(ctx.destination); osc.start(0);
+        ctx.oncomplete=function(e){ digest(e.renderedBuffer); };
+        timer=setTimeout(function(){done({timeout:true});},4000);
+        var rendering=ctx.startRendering();
+        if(rendering&&typeof rendering.then==='function') rendering.then(digest,function(e){done({error:e});});
+      }catch(e){ done({error:e}); }
+    });
+  }
+  function realtimeAudioSnapshot(){
+    var AC=root.AudioContext||root.webkitAudioContext;
+    if(!AC) return Promise.resolve(null);
+    var ctx;
+    try{ctx=new AC();}catch(e){return Promise.reject(e);}
+    return Promise.resolve().then(function(){
+      return {baseLatency:ctx.baseLatency,outputLatency:ctx.outputLatency,
+        sampleRate:ctx.sampleRate,state:ctx.state};
+    }).finally(function(){
+      try{ if(ctx&&typeof ctx.close==='function') return Promise.resolve(ctx.close()).catch(function(){}); }catch(_){}
     });
   }
   function audioBlock(){
@@ -558,20 +812,44 @@ function COLLECTOR(root){
       var OAC=root.OfflineAudioContext||root.webkitOfflineAudioContext;
       if(!OAC) return {available:M('audio.available',function(){return MSTATUS.unavailable;})};
       return renderAudioOnce().then(function(a){
-        if(!a||a.timeout) return {status:M('audio.status',function(){return MSTATUS.timeout;})};
-        return Promise.all([renderAudioOnce(),renderAudioOnce()]).then(function(more){ // P3 repeats
-          var hashes=[a.hash, more[0]&&more[0].hash, more[1]&&more[1].hash];
-          var stable = hashes[0]===hashes[1] && hashes[1]===hashes[2];
+        if(!a) return {available:M('audio.available',function(){return MSTATUS.unavailable;})};
+        if(a.timeout) return {status:M('audio.status',function(){return MSTATUS.timeout;})};
+        if(a.error) return {status:M('audio.status',function(){throw a.error;})};
+        return Promise.all([renderAudioOnce(),renderAudioOnce()]).then(function(more){
+          var failed=more.filter(function(x){return !x||x.timeout||x.error;})[0];
+          if(failed){
+            if(failed&&failed.timeout) return {status:M('audio.status',function(){return MSTATUS.timeout;})};
+            if(failed&&failed.error) return {status:M('audio.status',function(){throw failed.error;})};
+            return {status:M('audio.status',function(){return MSTATUS.invalid;})};
+          }
+          var hashes=[a.sha256,more[0].sha256,more[1].sha256];
+          var stable=hashes[0]===hashes[1]&&hashes[1]===hashes[2];
+          M('audio.status',function(){return 'ok';});
           M('audio.offline.sum',function(){return a.sum;});
-          M('audio.offline.hash',function(){return a.hash;});
-          M('audio.offline.bufLen',function(){return a.bufLen;});     // input length
+          M('audio.offline.sha256',function(){return a.sha256;});
+          M('audio.offline.fnv',function(){return a.fnv;});
+          M('audio.offline.sampleCount',function(){return a.sampleCount;});
+          M('audio.offline.byteLength',function(){return a.byteLength;});
           M('audio.offline.sampleRate',function(){return a.sampleRate;});
           M('audio.offline.stable',function(){return stable;});
-          M('audio.offline.repeats',function(){return hashes;});
-          // realtime is a SEPARATE audio path (Codex: offline/realtime/worklet split)
-          M('audio.realtime.baseLatency',function(){ return (new (root.AudioContext||root.webkitAudioContext)()).baseLatency; });
-          return { status:'ok', sum:String(a.sum), hash:a.hash, sampleRate:String(a.sampleRate),
-            stable:String(stable), repeats:hashes.join(',') };
+          M('audio.offline.sha256Repeats',function(){return hashes;});
+          // Realtime is a separate observation path; construction and cleanup
+          // happen outside M() getters so a measurement cannot create a device.
+          return realtimeAudioSnapshot().then(function(rt){
+            if(!rt){ M('audio.realtime.available',function(){return MSTATUS.unavailable;}); }
+            else{
+              M('audio.realtime.status',function(){return 'ok';});
+              M('audio.realtime.baseLatency',function(){return rt.baseLatency;});
+              M('audio.realtime.outputLatency',function(){return rt.outputLatency;});
+              M('audio.realtime.sampleRate',function(){return rt.sampleRate;});
+              M('audio.realtime.state',function(){return rt.state;});
+            }
+            return { status:'ok', sum:String(a.sum), sha256:a.sha256, sampleRate:String(a.sampleRate),
+              stable:String(stable), repeats:hashes.join(',') };
+          },function(e){
+            M('audio.realtime.status',function(){throw e;});
+            return {status:'realtime-error'};
+          });
         });
       });
     });
@@ -697,6 +975,21 @@ function COLLECTOR(root){
   // per-session random ufrag/pwd/ICE, so a whole-SDP hash differs every run and
   // is NOT a fingerprint — it used to produce false "masked" verdicts, so it's
   // gone. Codec/capability order IS stable and is what we keep.
+  function waitForIceGatheringComplete(pc,timeoutMs){
+    return new Promise(function(resolve,reject){
+      var settled=false,timer=null;
+      function cleanup(){
+        if(timer!==null)clearTimeout(timer);
+        try{pc.removeEventListener('icegatheringstatechange',changed);}catch(_){}
+      }
+      function finish(fn,value){if(settled)return;settled=true;cleanup();fn(value);}
+      function changed(){if(pc.iceGatheringState==='complete')finish(resolve,true);}
+      if(pc.iceGatheringState==='complete'){finish(resolve,true);return;}
+      try{pc.addEventListener('icegatheringstatechange',changed);}catch(e){finish(reject,e);return;}
+      timer=setTimeout(function(){var e=new Error('ICE gathering timeout');e.name='TimeoutError';finish(reject,e);},timeoutMs);
+      changed();
+    });
+  }
   function rtcBlock(){
     return A(function(){
       var RP=root.RTCPeerConnection||root.webkitRTCPeerConnection;
@@ -723,35 +1016,39 @@ function COLLECTOR(root){
       // signal — a candidate exposing a raw local IP (not an mDNS .local name).
       var cands=[], types={}, protos={}, comps={}, fams={};
       pc.onicecandidate=function(ev){ if(ev&&ev.candidate&&ev.candidate.candidate){
-        var cs=ev.candidate.candidate; cands.push(cs);
+        var candidate=ev.candidate,cs=candidate.candidate;
         var parts=cs.split(/\s+/);                                  // candidate:F comp proto prio addr port typ TYPE …
         var t=(/ typ (\w+)/.exec(cs)||[])[1]||'?'; types[t]=(types[t]||0)+1;
         var proto=(parts[2]||'').toLowerCase(); protos[proto]=(protos[proto]||0)+1;
         var comp=parts[1]==='1'?'rtp':parts[1]==='2'?'rtcp':(parts[1]||'?'); comps[comp]=(comps[comp]||0)+1;
         var addr=parts[4]||''; var fam=/\.local$/i.test(addr)?'mdns':addr.indexOf(':')>=0?'ipv6':/\d+\.\d+\.\d+\.\d+/.test(addr)?'ipv4':'?'; fams[fam]=(fams[fam]||0)+1;
+        cands.push({candidate:cs,foundation:candidate.foundation||parts[0].replace(/^candidate:/,''),
+          component:candidate.component||comp,protocol:(candidate.protocol||proto).toLowerCase(),
+          priority:candidate.priority==null?Number(parts[3]):candidate.priority,
+          address:candidate.address||addr,port:candidate.port==null?Number(parts[5]):candidate.port,
+          type:candidate.type||t,tcpType:candidate.tcpType||null,
+          relatedAddress:candidate.relatedAddress||null,relatedPort:candidate.relatedPort==null?null:candidate.relatedPort,
+          usernameFragment:candidate.usernameFragment||null,family:fam});
       } };
+      var firstSdp='';
       return pc.createOffer().then(function(o){
-        var sdp=o.sdp||'';
-        return Promise.resolve(pc.setLocalDescription(o)).then(function(){
-          return new Promise(function(res2){                       // wait ICE complete / 3s
-            if(pc.iceGatheringState==='complete') return res2();
-            var t=setTimeout(res2,3000);
-            pc.addEventListener('icegatheringstatechange',function(){ if(pc.iceGatheringState==='complete'){ clearTimeout(t); res2(); } });
-          }).then(function(){ return sdp; });
-        });
-      }).then(function(sdp){
+        firstSdp=o&&o.sdp||'';
+        if(!firstSdp){var empty=new Error('empty first offer');empty.name='InvalidResultError';throw empty;}
+        return Promise.resolve(pc.setLocalDescription(o));
+      }).then(function(){return waitForIceGatheringComplete(pc,3000);}).then(function(){return pc.createOffer();}).then(function(o2){
+        var sdp=firstSdp,sdp2=o2&&o2.sdp||'';
+        if(!sdp2){var empty=new Error('empty repeated offer');empty.name='InvalidResultError';throw empty;}
         var lines=sdp.split('\n'), pick=function(pfx){ return lines.filter(function(l){return l.indexOf(pfx)===0;}); };
         var rtpmap=rtpmapOf(sdp);
         var fmtp=pick('a=fmtp:').map(function(l){return l.replace(/^a=fmtp:\d+\s*/,'');}).sort();
         var extmap=pick('a=extmap:').map(function(l){return l.replace(/^a=extmap:\d+\s*/,'');}).sort();
-        var gatherComplete = pc.iceGatheringState==='complete';
-        // 2nd offer → codec-set stability across offers (Codex: repeated offers)
-        return Promise.resolve(pc.createOffer()).then(function(o2){ return o2.sdp||''; }, function(){ return ''; }).then(function(sdp2){
-          try{ pc.close(); }catch(_){}
-          var stable = sdp2 ? hash(rtpmap.join('|'))===hash(rtpmapOf(sdp2).join('|')) : true;
+        var gatherComplete=pc.iceGatheringState==='complete';
+        var stable=hash(rtpmap.join('|'))===hash(rtpmapOf(sdp2).join('|'));
           var cnt=function(o){return Object.keys(o).sort().map(function(k){return k+':'+o[k];}).join(',');};
+          M('webrtc.status',function(){return 'ok';});
           M('webrtc.iceGatheringComplete',function(){return gatherComplete;});
           M('webrtc.iceCandidateCount',function(){return cands.length;});
+          M('webrtc.iceCandidates',function(){return cands;});
           M('webrtc.iceCandidateTypes',function(){return cnt(types);});
           M('webrtc.iceCandidateProtocols',function(){return cnt(protos);});
           M('webrtc.iceCandidateComponents',function(){return cnt(comps);});
@@ -766,8 +1063,11 @@ function COLLECTOR(root){
             fingerprintAlgo: M('webrtc.fingerprintAlgo',function(){ var m=sdp.match(/a=fingerprint:(\S+)/); return m?m[1]:undefined; }),
             iceGatheringComplete:String(gatherComplete), iceCandidateCount:String(cands.length), offerStable:String(stable),
           }, caps);
-        });
-      }, function(e){ try{ pc.close(); }catch(_){} return Object.assign({status:'offer-error', error:M('webrtc.offerError',function(){ throw e; })}, caps); });
+      }).catch(function(e){
+        var timeout=e&&e.name==='TimeoutError';
+        M('webrtc.status',function(){if(timeout)return MSTATUS.timeout;throw e;});
+        return Object.assign({status:timeout?'timeout':'offer-error',error:e&&e.name},caps);
+      }).then(function(result){try{pc.close();}catch(_){}return result;},function(e){try{pc.close();}catch(_){}throw e;});
     });
   }
 
@@ -805,7 +1105,7 @@ function COLLECTOR(root){
               brands:M('uach.brands',function(){return uad.brands;}) };
       if(!uad.getHighEntropyValues) return o;
       return uad.getHighEntropyValues(['platform','platformVersion','architecture','bitness',
-        'model','uaFullVersion','fullVersionList','wow64','formFactor']).then(function(h){
+        'model','uaFullVersion','fullVersionList','wow64','formFactors']).then(function(h){
         Object.keys(h).sort().forEach(function(k){
           // getHighEntropyValues ALWAYS echoes the low-entropy brands/mobile too —
           // they're already emitted above, so skip them here or we produce a
@@ -917,7 +1217,14 @@ function COLLECTOR(root){
         var parts=[]; map.forEach(function(v,k){ parts.push(k+'='+v); }); parts.sort();
         var joined=parts.join(',');
         return { size:M('keyboard.size',function(){return parts.length;}), hash:M('keyboard.hash',function(){return hash(joined);}) };
-      },function(e){ return {error:M('keyboard.error',function(){ throw e; })}; });
+      },function(e){
+        // An opaque sandbox cannot use Keyboard Map unless the browser accepts
+        // its delegated policy. This is a capability outcome, not a collector
+        // failure. Keep other contexts/errors strict.
+        if(CUR.context==='sandboxed-iframe'&&e&&e.name==='SecurityError')
+          return {available:M('keyboard.available',function(){return MSTATUS.blocked;})};
+        return {error:M('keyboard.error',function(){ throw e; })};
+      });
     });
   }
 
@@ -941,7 +1248,16 @@ function COLLECTOR(root){
         // usageDetails buckets (partitioning-ish signal); usage itself is churn.
         o.usageDetails=M('storage.usageDetails',function(){ return e.usageDetails?Object.keys(e.usageDetails).sort().join(','):MSTATUS.unavailable; });
         return (st.persisted?st.persisted():Promise.resolve(null)).then(function(p){ o.persisted=M('storage.persisted',(function(pp){return function(){return pp;};})(p)); return o; }, function(){ o.persisted=M('storage.persisted',function(){return MSTATUS.unavailable;}); return o; });
-      },function(e){ o.status='estimate-error'; o.error=M('storage.error',function(){ throw e; }); return o; });
+      },function(e){
+        // StorageManager.estimate() rejects with TypeError (rather than
+        // SecurityError) in Chrome's deliberate opaque sandbox. Emit the exact
+        // capability path/status so a normal sandbox is not mistaken for a
+        // broken collection, while the same TypeError elsewhere still fails.
+        if(CUR.context==='sandboxed-iframe'&&e&&(e.name==='TypeError'||e.name==='SecurityError')){
+          o.status='blocked';o.estimate=M('storage.estimate',function(){return MSTATUS.blocked;});return o;
+        }
+        o.status='estimate-error'; o.error=M('storage.error',function(){ throw e; }); return o;
+      });
     });
   }
 
@@ -1025,7 +1341,8 @@ function COLLECTOR(root){
         timeOrigin:M('env.timeOrigin',function(){ return root.performance&&root.performance.timeOrigin; }),
       };
       var vv=root.visualViewport;
-      if(vv){ o.vvScale=M('env.vvScale',function(){ return vv.scale; }); o.vvWidth=M('env.vvWidth',function(){ return Math.round(vv.width); }); }
+      o.vvScale=M('env.vvScale',function(){ return vv?vv.scale:MSTATUS.unavailable; });
+      o.vvWidth=M('env.vvWidth',function(){ return vv?Math.round(vv.width):MSTATUS.unavailable; });
       return o;
     });
   }
@@ -1135,33 +1452,102 @@ function COLLECTOR(root){
     });
   }
 
-  /* ---- независимый контроль: ThumbmarkJS (MIT) ----------------------- */
-  // Second, independently-implemented fingerprint set as a CONTROL (Codex §7).
-  // Needs a document (main-frame/iframe); its raw components go under control.*
-  // and never feed our verdicts. Loaded on demand, graceful on any failure.
-  // Independent CONTROL engines (Codex v4 §Control): several self-hosted, pinned
-  // MIT fingerprint sets whose RAW components go under control.* and never feed
-  // our verdicts. All telemetry OFF — Thumbmark logging:false, FingerprintJS
-  // monitoring:false — so a control engine makes ZERO external requests.
+  /* ---- независимые контрольные движки -------------------------------- */
+  // Four vendored control engines run only in the main document. Their exact
+  // typed components go under control.* and never feed our verdicts. Each keeps
+  // its upstream license; runtime no-egress is proved by the browser request
+  // ledger, not inferred from these configuration flags alone.
   function controlBlock(){
     return A(function(){
       if(typeof document==='undefined'||!document.head) return {status:'unavailable-in-context'};
-      function loadScript(url){
+      // Exact reviewed bytes from assets/vendor/vendor-lock.json. The build/hash
+      // query makes the server route fail closed across rolling deployments;
+      // browser-enforced SRI independently refuses different response bytes.
+      var CONTROL_ARTIFACTS=Object.freeze({
+        thumbmark:Object.freeze({sha256:'5a12ec3d520aa95b7df0e54ab653c9c594cb8d89a430011c01cd1f8a5deb4bae',sri:'sha256-WhLsPVIKqVt98OVKtlPJxZTLjYmkMAEcAc0fil3rS64='}),
+        fingerprintjs:Object.freeze({sha256:'d089678feb7cd84853cb5f0266d6568a3c751c3c204545b70c9013c29cc292f1',sri:'sha256-0Ilnj+t82EhTy18CZtZWijx1HDwgRUW3DJATwpzCkvE='}),
+        fpscanner:Object.freeze({sha256:'8414f22e6f2466dae55c37b8c8375344679f9469f58590a333d00a16bdc6982c',sri:'sha256-hBTyLm8kZtrlXDe4yDdTRGeflGn1hZCjM9AKFr3GmCw='}),
+        clientjs:Object.freeze({sha256:'5077379fc482d99daeceafb9b63cac07e24f29c6dfba28c445baf3f2ce4d9f22',sri:'sha256-UHc3n8SC2Z2uzq+5tjysB+JPKcbfuijERbrz8s5NnyI='})
+      });
+      function loadScript(engine){
         return new Promise(function(res){
-          var s=document.createElement('script'); s.src=url;
-          s.onerror=function(){ res(false); }; s.onload=function(){ res(true); };
-          try{ document.head.appendChild(s); }catch(e){ res(false); }
-          setTimeout(function(){ res(false); },12000);
+          var spec=CONTROL_ARTIFACTS[engine]; if(!spec){res(false);return;}
+          var settled=false,timer=null,s=document.createElement('script');
+          function finish(value){if(settled)return;settled=true;if(timer!==null)clearTimeout(timer);s.onload=null;s.onerror=null;res(value);}
+          var url=new URL('/fingerprint/control',location.origin);
+          url.searchParams.set('engine',engine);url.searchParams.set('build',EMBEDDED_COLLECTOR_BUILD);url.searchParams.set('sha256',spec.sha256);
+          s.src=url.pathname+url.search;s.integrity=spec.sri;s.crossOrigin='anonymous';s.referrerPolicy='no-referrer';
+          s.onerror=function(){finish(false);};s.onload=function(){finish(true);};
+          timer=setTimeout(function(){finish(false);},12000);
+          try{document.head.appendChild(s);}catch(e){finish(false);return;}
         });
       }
-      // Per-engine typed MANIFEST (Codex v4.3 #5): engine/version/status/duration/
-      // componentCount/errorCount/hash — emitted as one typed record so the server
-      // can grade controlStatus rigorously (not just "prefix present").
-      function engineManifest(ns, o){ M('control.'+ns+'.__manifest', function(){ return o; }); return o; }
-      function ctrlHash(x){ try{ return sha256hex(JSON.stringify(x)); }catch(e){ return null; } }
+      // Per-engine typed MANIFEST. It is derived from the exact typed rows that
+      // were just emitted, rather than from the engine's pre-encoding object.
+      // The server independently rebuilds this same key set and encoded-value
+      // map, so a manifest cannot certify omitted or differently encoded rows.
+      function canonicalForControlHash(v){
+        if(Array.isArray(v)) return v.map(canonicalForControlHash);
+        if(v&&typeof v==='object'){
+          var o=Object.create(null), ks=Object.keys(v).sort();
+          for(var i=0;i<ks.length;i++) o[ks[i]]=canonicalForControlHash(v[ks[i]]);
+          return o;
+        }
+        return v;
+      }
+      function ctrlHash(x){ try{ return sha256hex(JSON.stringify(canonicalForControlHash(x))); }catch(e){ return null; } }
+      function controlDerived(ns,suffix){
+        return (ns==='thumbmark'&&suffix==='hash')
+          ||(ns==='fingerprintjs'&&suffix==='visitorId')
+          ||(ns==='fpscanner'&&suffix.indexOf('test.')===0);
+      }
+      function controlRowState(ns){
+        var prefix='control.'+ns+'.', rows=(CUR.recs||[]).filter(function(r){
+          if(!r||typeof r.path!=='string'||r.path.indexOf(prefix)!==0||r.path===prefix+'__manifest') return false;
+          return !controlDerived(ns,r.path.slice(prefix.length));
+        });
+        var keys=rows.map(function(r){return r.path.slice(prefix.length);}).sort();
+        var map=Object.create(null);
+        rows.forEach(function(r){
+          var meta={};
+          if(r.meta&&r.meta.special!=null) meta.special=r.meta.special;
+          if(r.meta&&r.meta.count!=null) meta.count=r.meta.count;
+          map[r.path.slice(prefix.length)]={valueType:r.valueType,value:r.value,meta:meta};
+        });
+        return {keys:keys,map:map};
+      }
+      function controlTestState(ns){
+        var prefix='control.'+ns+'.test.', rows=(CUR.recs||[]).filter(function(r){
+          return r&&typeof r.path==='string'&&r.path.indexOf(prefix)===0;
+        });
+        var keys=rows.map(function(r){return r.path.slice(prefix.length);}).sort();
+        var map=Object.create(null);
+        rows.forEach(function(r){
+          var meta={};
+          if(r.meta&&r.meta.special!=null) meta.special=r.meta.special;
+          if(r.meta&&r.meta.count!=null) meta.count=r.meta.count;
+          map[r.path.slice(prefix.length)]={valueType:r.valueType,value:r.value,meta:meta};
+        });
+        return {keys:keys,map:map};
+      }
+      function sameSortedStrings(left,right){
+        if(!Array.isArray(left)||!Array.isArray(right)||left.length!==right.length)return false;
+        for(var i=0;i<left.length;i++)if(left[i]!==right[i])return false;
+        return true;
+      }
+      function engineManifest(ns, o){
+        var state=controlRowState(ns), manifest={};
+        Object.keys(o||{}).forEach(function(k){manifest[k]=o[k];});
+        manifest.componentKeys=state.keys;
+        manifest.componentCount=state.keys.length;
+        manifest.hash=ctrlHash(state.map);
+        manifest.hashAlgorithm='sha256';
+        M('control.'+ns+'.__manifest', function(){ return manifest; });
+        return manifest;
+      }
 
       function runThumbmark(){
-        return loadScript('/fingerprint/control?engine=thumbmark').then(function(okL){
+        return loadScript('thumbmark').then(function(okL){
           if(!okL) return engineManifest('thumbmark',{engine:'thumbmarkjs',version:'1.11.0',status:'load-error',componentCount:0,errorCount:1});
           var T=root.ThumbmarkJS;
           if(!T||typeof T.getFingerprint!=='function') return engineManifest('thumbmark',{engine:'thumbmarkjs',version:'1.11.0',status:'no-api',componentCount:0,errorCount:1});
@@ -1174,12 +1560,12 @@ function COLLECTOR(root){
             var ks=[]; try{ ks=Object.keys(comps||{}); }catch(e){}
             var errs=0; ks.forEach(function(k){ M('control.thumbmark.'+k,(function(vv){return function(){return vv;};})(comps[k])); });
             M('control.thumbmark.hash',function(){return hash;});
-            return engineManifest('thumbmark',{engine:'thumbmarkjs',version:'1.11.0',status:'ok',durationMs:+(nowMs()-t0).toFixed(1),componentCount:ks.length,errorCount:errs,hash:hash});
+            return engineManifest('thumbmark',{engine:'thumbmarkjs',version:'1.11.0',status:'ok',durationMs:+(nowMs()-t0).toFixed(1),errorCount:errs});
           },function(e){ return engineManifest('thumbmark',{engine:'thumbmarkjs',version:'1.11.0',status:'error',error:'ERR:'+(e&&e.name),componentCount:0,errorCount:1}); });
         });
       }
       function runFingerprintjs(){
-        return loadScript('/fingerprint/control?engine=fingerprintjs').then(function(okL){
+        return loadScript('fingerprintjs').then(function(okL){
           if(!okL) return engineManifest('fingerprintjs',{engine:'fingerprintjs',version:'5.0.0',status:'load-error',componentCount:0,errorCount:1});
           var F=root.FingerprintJS;
           if(!F||typeof F.load!=='function') return engineManifest('fingerprintjs',{engine:'fingerprintjs',version:'5.0.0',status:'no-api',componentCount:0,errorCount:1});
@@ -1190,7 +1576,7 @@ function COLLECTOR(root){
             ks.forEach(function(k){ var c=comps[k]; if(c&&c.error)errs++;
               M('control.fingerprintjs.'+k,(function(cc){return function(){return {value:(cc&&'value' in cc)?cc.value:null,duration:cc&&cc.duration,error:cc&&cc.error?String(cc.error):null};};})(c)); });
             M('control.fingerprintjs.visitorId',function(){return String(r.visitorId);});
-            return engineManifest('fingerprintjs',{engine:'fingerprintjs',version:String(r.version||'5.0.0'),status:'ok',durationMs:+(nowMs()-t0).toFixed(1),componentCount:ks.length,errorCount:errs,hash:String(r.visitorId)});
+            return engineManifest('fingerprintjs',{engine:'fingerprintjs',version:String(r.version||'5.0.0'),status:'ok',durationMs:+(nowMs()-t0).toFixed(1),errorCount:errs});
           },function(e){ return engineManifest('fingerprintjs',{engine:'fingerprintjs',version:'5.0.0',status:'error',error:'ERR:'+(e&&e.name),componentCount:0,errorCount:1}); });
         });
       }
@@ -1236,25 +1622,53 @@ function COLLECTOR(root){
       // genuine collector + analyser; raw signals + per-test verdicts under
       // control.fpscanner.*
       function runFpscanner(){
-        return loadScript('/fingerprint/control?engine=fpscanner').then(function(okL){
+        return loadScript('fpscanner').then(function(okL){
           if(!okL) return engineManifest('fpscanner',{engine:'fpscanner',version:'0.1.5+fpcollect1.0.5',status:'load-error',componentCount:0,errorCount:1});
           var C=root.fpCollect, S2=root.fpScanner;
-          if(!C||!C.generateFingerprint||!S2||!S2.analyseFingerprint) return engineManifest('fpscanner',{engine:'fpscanner',version:'0.1.5+fpcollect1.0.5',status:'no-api',componentCount:0,errorCount:1});
+          if(!C||!C.generateFingerprint||!S2||!S2.analyseFingerprint||!S2.TESTS) return engineManifest('fpscanner',{engine:'fpscanner',version:'0.1.5+fpcollect1.0.5',status:'no-api',componentCount:0,errorCount:1});
           var t0=nowMs();
           return Promise.resolve(C.generateFingerprint()).then(function(fp){
-            var analysis; try{ analysis=S2.analyseFingerprint(fp); }catch(e){ analysis=null; }
-            // Full RAW signals, LOSSLESS (encodeValue handles nested objects — no slice).
+            // Full bounded typed signals (encodeValue preserves nested structure
+            // and emits explicit truncation/blob metadata instead of slicing).
             var ks=[]; try{ ks=Object.keys(fp||{}); }catch(e){}
             ks.forEach(function(k){ M('control.fpscanner.'+k,(function(vv){return function(){return vv;};})(fp[k])); });
+            var expectedKeys=[];
+            try{ expectedKeys=Object.keys(S2.TESTS).map(function(k){return String(S2.TESTS[k]);}).sort(); }catch(e){}
+            var analysis;
+            try{ analysis=S2.analyseFingerprint(fp); }
+            catch(e){
+              return engineManifest('fpscanner',{engine:'fpscanner',version:'0.1.5+fpcollect1.0.5',
+                status:'analysis-error',durationMs:+(nowMs()-t0).toFixed(1),error:'ERR:'+(e&&e.name),
+                testCount:0,testKeys:[],testKeySetHash:ctrlHash([]),testSetHash:ctrlHash({}),
+                testHashAlgorithm:'sha256',expectedTestKeys:expectedKeys,
+                expectedTestKeySetHash:ctrlHash(expectedKeys),inconsistentCount:0,errorCount:1});
+            }
+            if(!analysis||typeof analysis!=='object'||Array.isArray(analysis)){
+              return engineManifest('fpscanner',{engine:'fpscanner',version:'0.1.5+fpcollect1.0.5',
+                status:'analysis-invalid',durationMs:+(nowMs()-t0).toFixed(1),error:'invalid analysis result',
+                testCount:0,testKeys:[],testKeySetHash:ctrlHash([]),testSetHash:ctrlHash({}),
+                testHashAlgorithm:'sha256',expectedTestKeys:expectedKeys,
+                expectedTestKeySetHash:ctrlHash(expectedKeys),inconsistentCount:0,errorCount:1});
+            }
             // FPScanner consistent enum: 1=INCONSISTENT, 2=UNSURE, 3=CONSISTENT
             // (Codex v4.3 #4). Keep each test's RAW consistent + data.
             var VERD={1:'INCONSISTENT',2:'UNSURE',3:'CONSISTENT'};
-            var testKeys=[], inconsistent=0;
-            try{ testKeys=analysis?Object.keys(analysis):[]; }catch(e){}
-            testKeys.forEach(function(k){ var a=analysis[k]||{}; var verdict=VERD[a.consistent]||('raw:'+a.consistent);
+            var analysisKeys=[], inconsistent=0, invalidTests=0;
+            try{ analysisKeys=Object.keys(analysis).sort(); }catch(e){}
+            analysisKeys.forEach(function(k){ var a=analysis[k]||{}; var verdict=VERD[a.consistent]||('raw:'+a.consistent);
+              if(!Object.prototype.hasOwnProperty.call(VERD,a.consistent))invalidTests++;
               if(a.consistent===1) inconsistent++;
               M('control.fpscanner.test.'+k,(function(aa,vd){return function(){return {consistent:aa.consistent,verdict:vd,data:aa.data};};})(a,verdict)); });
-            return engineManifest('fpscanner',{engine:'fpscanner',version:'0.1.5+fpcollect1.0.5',status:'ok',durationMs:+(nowMs()-t0).toFixed(1),componentCount:ks.length,testCount:testKeys.length,inconsistentCount:inconsistent,errorCount:0,hash:ctrlHash(fp)});
+            var tests=controlTestState('fpscanner');
+            var exactSet=expectedKeys.length>0&&sameSortedStrings(analysisKeys,expectedKeys)
+              &&sameSortedStrings(tests.keys,expectedKeys);
+            var healthy=exactSet&&invalidTests===0;
+            return engineManifest('fpscanner',{engine:'fpscanner',version:'0.1.5+fpcollect1.0.5',
+              status:healthy?'ok':'analysis-invalid',durationMs:+(nowMs()-t0).toFixed(1),
+              testCount:tests.keys.length,testKeys:tests.keys,testKeySetHash:ctrlHash(tests.keys),
+              testSetHash:ctrlHash(tests.map),testHashAlgorithm:'sha256',expectedTestKeys:expectedKeys,
+              expectedTestKeySetHash:ctrlHash(expectedKeys),inconsistentCount:inconsistent,
+              invalidTestCount:invalidTests,errorCount:healthy?0:1});
           },function(e){ return engineManifest('fpscanner',{engine:'fpscanner',version:'0.1.5+fpcollect1.0.5',status:'error',error:'ERR:'+(e&&e.name),componentCount:0,errorCount:1}); });
         });
       }
@@ -1262,7 +1676,7 @@ function COLLECTOR(root){
       // jackspirou), drop-in window.ClientJS. Full component getters under
       // control.clientjs.*
       function runClientjs(){
-        return loadScript('/fingerprint/control?engine=clientjs').then(function(okL){
+        return loadScript('clientjs').then(function(okL){
           if(!okL) return engineManifest('clientjs',{engine:'clientjs',version:'0.2.1',status:'load-error',componentCount:0,errorCount:1});
           var CJ=root.ClientJS;
           if(!CJ) return engineManifest('clientjs',{engine:'clientjs',version:'0.2.1',status:'no-api',componentCount:0,errorCount:1});
@@ -1272,7 +1686,7 @@ function COLLECTOR(root){
             var getters=['getFingerprint','getUserAgent','getBrowser','getBrowserVersion','getOS','getOSVersion','getDevice','getCPU','getEngine','getScreenPrint','getColorDepth','getCurrentResolution','getAvailableResolution','getTimeZone','getLanguage','getSystemLanguage','getCanvasPrint','getPlugins','getFonts'];
             var comps={}, errs=0;
             getters.forEach(function(g){ try{ var v=c[g]?c[g]():undefined; comps[g]=v; M('control.clientjs.'+g,(function(vv){return function(){return vv;};})(v)); }catch(e){ errs++; M('control.clientjs.'+g,function(){ throw e; }); } });
-            return engineManifest('clientjs',{engine:'clientjs',version:'0.2.1',status:'ok',durationMs:+(nowMs()-t0).toFixed(1),componentCount:getters.length-errs,errorCount:errs,hash:ctrlHash(comps)});
+            return engineManifest('clientjs',{engine:'clientjs',version:'0.2.1',status:'ok',durationMs:+(nowMs()-t0).toFixed(1),errorCount:errs});
           }catch(e){ return engineManifest('clientjs',{engine:'clientjs',version:'0.2.1',status:'error',error:'ERR:'+(e&&e.name),componentCount:0,errorCount:1}); }
         });
       }
@@ -1318,8 +1732,8 @@ function COLLECTOR(root){
         ['device',   deviceBlock()],
         ['intlx',    Promise.resolve(intlExtraBlock())],
         ['errors',   errorBlock()],
-        // Control engines load external scripts (Thumbmark/FingerprintJS) — that
-        // belongs ONLY in the main document. Running it in every worker/iframe/
+        // Vendored control engines need document script globals and belong ONLY
+        // in the main document. Running them in every worker/iframe/
         // OOPIF added ~24s each and blew their harness timeouts. Main-frame only.
         ['control',  contextName==='main-frame' ? controlBlock() : Promise.resolve({status:'skipped-non-main'})],
       ];
@@ -1329,14 +1743,24 @@ function COLLECTOR(root){
       // and the realm always posts its snapshot back. control is main-frame-only
       // and can legitimately spend longer loading engines, so it gets a wide cap.
       function jobGuard(name,p,cap){ return new Promise(function(resolve){ var settled=false;
+        function rejected(e,label){
+          try{ meas.push({path:name+'.__job',context:contextName,phase:'passive',status:STATUS.error,
+            valueType:null,value:null,error:{name:'JobRejected',message:label+': '+String(e&&e.message||e),causeName:String(e&&e.name||'Error')},
+            meta:{}}); }catch(_){}
+        }
         var to=setTimeout(function(){ if(!settled){ settled=true;
           // Codex v4.2 #6: a timed-out job leaves a TYPED record (status=timeout),
           // not only the legacy 'ERR:job-timeout' sentinel, so the manifest and
           // validator see a real terminal status for the block.
           try{ meas.push({path:name+'.__job',context:contextName,phase:'passive',status:STATUS.timeout,valueType:null,value:null,error:{name:'JobTimeout',message:'job exceeded '+cap+'ms'},meta:{durationMs:cap}}); }catch(_){}
           resolve('ERR:job-timeout'); } },cap);
-        Promise.resolve(p).then(function(v){ if(!settled){ settled=true; clearTimeout(to); resolve(v); } },
-          function(e){ if(!settled){ settled=true; clearTimeout(to); resolve('ERR:'+(e&&e.name)); } }); }); }
+        Promise.resolve(p).then(function(v){ if(!settled){ settled=true; clearTimeout(to);
+            // Several legacy block wrappers return an ERR:* sentinel instead of
+            // rejecting. Preserve it for the old flat view, but also emit an
+            // explicit typed failure so strict readiness cannot miss the block.
+            if(typeof v==='string'&&v.indexOf('ERR:')===0) rejected(new Error(v.slice(4)),'error sentinel');
+            resolve(v); } },
+          function(e){ if(!settled){ settled=true; clearTimeout(to); rejected(e,'promise rejected'); resolve('ERR:'+(e&&e.name)); } }); }); }
       return Promise.all(jobs.map(function(j){ var cap=j[0]==='control'?60000:(j[0]==='webgpu'?20000:12000); return jobGuard(j[0], j[1], cap).then(function(v){ return [j[0],v]; }); }))
         .then(function(parts){
           parts.forEach(function(kv){
@@ -1365,8 +1789,17 @@ function COLLECTOR(root){
                   value:enc?enc.value:null,error:er,meta:{}});
               });
             }
+            var expectedJobs=jobs.map(function(j){return j[0];});
+            var completedJobs=parts.map(function(kv){return kv[0];});
+            var failedJobs=meas.filter(function(r){return r&&/\.__job$/.test(r.path||'')&&r.status!=='ok';})
+              .map(function(r){return String(r.path).slice(0,-6);});
+            var cm=encodeValue({collectorVersion:'4.4.0',context:contextName,
+              expectedJobs:expectedJobs,completedJobs:completedJobs,failedJobs:failedJobs,
+              measurementCount:meas.length+1});
+            meas.push({path:'collector.__manifest',context:contextName,phase:'passive',status:STATUS.ok,
+              valueType:cm.valueType,value:cm.value,error:null,meta:{}});
             base._measurements=meas;
-            base._schema='typed-v4-partial'; // deep-walk + migrated blocks typed
+            base._schema='typed-v4';
           }catch(e){ base._measurementsError='ERR:'+(e&&e.name); }
           CUR.recs=null;
           base._collectMs=Math.round(((root.performance||Date).now())-t0);
@@ -1375,12 +1808,17 @@ function COLLECTOR(root){
     });
   }
 
-  root.LinkageProbe={ collect:collect, hash:hash, walk:walk, walkTyped:walkTyped, encodeValue:encodeValue, version:4 };
+  root.LinkageProbe={ collect:collect, hash:hash, sha256hex:sha256hex, walk:walk,
+    walkTyped:walkTyped, encodeValue:encodeValue, version:'4.4.0' };
 }
 COLLECTOR(typeof self!=='undefined'?self:this);
 
 /* ---- харнесс: воркеры, worklet, отправка (без дублирования кода) ------ */
-var COLLECTOR_SRC='('+COLLECTOR.toString()+')(self);';
+// Mandatory server-rendered constants. `const` makes the lexical binding
+// immutable and the source itself never depends on a possibly patched
+// Function.prototype.toString in the browser under test.
+const COLLECTOR_SRC=/*__FP_COLLECTOR_SOURCE_INJECT__*/;
+const EMBEDDED_COLLECTOR_ARTIFACT_SHA256='__FP_COLLECTOR_ARTIFACT_SHA256__';
 var WORKER_SRC="self.onmessage=async()=>{var m=await self.LinkageProbe.collect('__KIND__');self.postMessage(m);};"
   +"self.onconnect=(e)=>{var p=e.ports[0];p.start();p.onmessage=async()=>p.postMessage(await self.LinkageProbe.collect('__KIND__'));};";
 
@@ -1388,10 +1826,10 @@ var WORKER_SRC="self.onmessage=async()=>{var m=await self.LinkageProbe.collect('
 // must not blindly reference navigator (that threw ReferenceError -> ERR:*);
 // missing APIs report 'unavailable-in-context'. Only genuinely-available worklet
 // globals (sampleRate/currentTime/currentFrame) plus Intl/Math are measured.
-var WORKLET_SRC="class Probe extends AudioWorkletProcessor{constructor(){super();this.port.onmessage=()=>{"
+var WORKLET_SRC=COLLECTOR_SRC+"class Probe extends AudioWorkletProcessor{constructor(){super();this.port.onmessage=()=>{"
   +"var S=(f)=>{try{var v=f();return v===undefined?'undef':v;}catch(e){return 'ERR:'+e.name;}};"
   +"var NAV=(g)=>S(()=>typeof navigator==='undefined'?'unavailable-in-context':g());"
-  +"var H=(s)=>{var h=2166136261;for(var i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619);}return (h>>>0).toString(16);};"
+  +"var H=(s)=>self.LinkageProbe.sha256hex(String(s));"
   // DSP-result: a deterministic nonlinear signal computed IN the worklet realm —
   // exercises this realm's float math (Codex P2/P3: AudioWorklet DSP output).
   +"var dsp=(function(){var acc=0,out=[];for(var i=0;i<256;i++){var x=Math.sin(i*0.19)+Math.tanh(i*0.017)*0.5+Math.cbrt(i+1)*0.001;acc+=Math.abs(x);out.push(Math.round(x*1e6)/1e6);}return {sum:acc,hash:H(out.join(',')),len:out.length};})();"
@@ -1407,12 +1845,168 @@ var WORKLET_SRC="class Probe extends AudioWorkletProcessor{constructor(){super()
   // structured signal instead of the bare string 'undefined' (Codex P2)
   +"'worklet.hasNavigator':S(()=>typeof navigator==='undefined'?'unavailable-in-context':'present'),"
   +"'worklet.dsp.sum':dsp.sum,'worklet.dsp.hash':dsp.hash,'worklet.dsp.len':dsp.len,"
-  +"'worklet.globals':S(()=>Object.getOwnPropertyNames(globalThis).sort().join(','))});};}process(){return true;}}"
+  +"'worklet.globals':S(()=>Object.getOwnPropertyNames(globalThis).sort().join(',')),"
+  +"'worklet.__manifest':{version:'4.4.0',status:'ok',probeCount:16}});};}process(){return true;}}"
   +"registerProcessor('probe',Probe);";
 
-var COLLECT_URL=new URLSearchParams(location.search).get('collect')||'/collect';
+function resolveCollectUrl(search,baseUrl){
+  var raw=new URLSearchParams(search||'').get('collect');
+  if(!raw) return '/collect';
+  var base=new URL(baseUrl), target=new URL(raw,base);
+  if(target.origin!==base.origin||target.username||target.password||raw.slice(0,2)==='//')
+    throw new Error('unsafe collect URL override');
+  return target.pathname+target.search;
+}
+var COLLECT_URL=resolveCollectUrl(location.search,location.href);
+// The private serving route MUST replace this exact placeholder with the
+// provenance-root hash used for this HTML+encoder artifact. A cached page from
+// build A then refuses to stamp itself as build B after a deployment rolls.
+var EMBEDDED_COLLECTOR_BUILD='__FP_BROWSER_COLLECTOR_BUILD__';
 var logEl=document.getElementById('log');
 function log(s,c){ var d=document.createElement('div'); if(c)d.className=c; d.textContent=s; logEl.append(d); }
+var RUN_IDENTITY=null;
+var OOPIF_EXPECTATION=null;
+
+// Bound all panel calls. The panel must additionally make persistence
+// idempotent; this timeout prevents a dead route from hanging the one-shot run.
+function boundedRequest(url,options,timeoutMs,bodyMode,maxBytes){
+  return new Promise(function(resolve,reject){
+    var settled=false, reader=null, ctrl=(typeof AbortController==='function')?new AbortController():null;
+    var opts=Object.assign({},options||{}); if(ctrl&&!opts.signal)opts.signal=ctrl.signal;
+    var timer=setTimeout(function(){ if(settled)return; settled=true; try{if(ctrl)ctrl.abort();}catch(_){}
+      try{if(reader)reader.cancel();}catch(_){}
+      var e=new Error('fetch timeout after '+timeoutMs+'ms'); e.name='TimeoutError'; reject(e); },timeoutMs);
+    function done(value){if(!settled){settled=true;clearTimeout(timer);resolve(value);}}
+    function failed(e){if(!settled){settled=true;clearTimeout(timer);reject(e);}}
+    Promise.resolve().then(function(){return fetch(url,opts);}).then(async function(r){
+      if(bodyMode!=='json'){done(r);return;}
+      var cap=maxBytes||65536, text='';
+      if(r.body&&typeof r.body.getReader==='function'){
+        reader=r.body.getReader(); var decoder=new TextDecoder(), total=0;
+        while(true){ var part=await reader.read(); if(part.done)break;
+          total+=part.value.byteLength; if(total>cap)throw new Error('response body exceeds '+cap+' bytes');
+          text+=decoder.decode(part.value,{stream:true}); }
+        text+=decoder.decode();
+      }else{
+        text=await r.text(); if(text.length>cap)throw new Error('response body exceeds '+cap+' characters');
+      }
+      var data; try{data=JSON.parse(text);}catch(e){e.message='invalid JSON response: '+e.message;throw e;}
+      done({response:r,data:data});
+    },failed).catch(failed);
+  });
+}
+function boundedFetch(url,options,timeoutMs){return boundedRequest(url,options,timeoutMs,'none',0);}
+function boundedJson(url,options,timeoutMs,maxBytes){return boundedRequest(url,options,timeoutMs,'json',maxBytes||65536);}
+
+// Canonical recursive sorted-key JSON. The server hashes OOPIF process evidence
+// with the same representation; insertion order can never change its identity.
+function canonicalIdentityJson(value){
+  function sorted(v){
+    if(Array.isArray(v)) return v.map(sorted);
+    if(v&&typeof v==='object'){
+      var out={}; Object.keys(v).sort().forEach(function(k){out[k]=sorted(v[k]);}); return out;
+    }
+    return v;
+  }
+  return JSON.stringify(sorted(value));
+}
+function validRegistrableSite(site){
+  return typeof site==='string'&&site.length>0&&site.length<=253&&site===site.toLowerCase()
+    &&/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/.test(site)&&site.indexOf('..')<0;
+}
+function hostBelongsToSite(host,site){ return host===site||host.endsWith('.'+site); }
+function validServiceWorkerToken(value){ return typeof value==='string'&&/^[A-Za-z0-9_-]{22,240}$/.test(value); }
+function boundChildRequestId(){
+  if(!(crypto&&typeof crypto.getRandomValues==='function')) throw new Error('secure child request id unavailable');
+  var bytes=new Uint8Array(16),out=''; crypto.getRandomValues(bytes);
+  for(var i=0;i<bytes.length;i++) out+=('0'+bytes[i].toString(16)).slice(-2);
+  return out;
+}
+function expectedBoundChild(context,requestId,parentOrigin){
+  if(!RUN_IDENTITY||!/^[0-9a-f]{64}$/.test(RUN_IDENTITY.collectorArtifactSha256||''))
+    throw new Error('capture identity not initialized for child realm');
+  var core={protocol:'fingerprint-bound-child',handshakeVersion:1,context:context,
+    collectorBuild:RUN_IDENTITY.collectorBuild,
+    collectorArtifactSha256:RUN_IDENTITY.collectorArtifactSha256,
+    captureKey:RUN_IDENTITY.captureKey,requestId:requestId,parentOrigin:parentOrigin};
+  core.acknowledgementSha256=LinkageProbe.sha256hex(canonicalIdentityJson(core));
+  return core;
+}
+function bindChildUrl(url,binding){
+  var u=new URL(url,location.href);
+  if(u.search||u.hash)throw new Error('bound child base URL must not contain query or fragment');
+  u.searchParams.set('fpVersion','1');
+  u.searchParams.set('fpContext',binding.context);
+  u.searchParams.set('fpBuild',binding.collectorBuild);
+  u.searchParams.set('fpArtifact',binding.collectorArtifactSha256);
+  u.searchParams.set('fpCapture',binding.captureKey);
+  u.searchParams.set('fpRequest',binding.requestId);
+  u.searchParams.set('fpParent',binding.parentOrigin);
+  u.searchParams.set('fpAck',binding.acknowledgementSha256);
+  return u;
+}
+function validateBoundChildMessage(event,frame,expected,expectedOrigin){
+  if(!event||event.source!==frame.contentWindow||event.origin!==expectedOrigin)
+    throw new Error('bound child source/origin mismatch');
+  var envelope=event.data,binding=envelope&&envelope.binding,payload=envelope&&envelope.payload;
+  if(!envelope||envelope.__fpBoundChild!==1||!binding
+      ||canonicalIdentityJson(binding)!==canonicalIdentityJson(expected))
+    throw new Error('bound child identity mismatch');
+  if(!payload||typeof payload!=='object'||Array.isArray(payload)||payload._context!==expected.context
+      ||!payload._boundChild
+      ||canonicalIdentityJson(payload._boundChild)!==canonicalIdentityJson(expected))
+    throw new Error('bound child payload mismatch');
+  return payload;
+}
+
+// These are server/session facts, not a user-visible run history. `pairKey` is
+// the existing sid and `captureKey` is deterministically sid+environment.
+async function initRunIdentity(){
+  var qs=new URLSearchParams(location.search), environment=qs.get('env'), pairKey=qs.get('sid');
+  if((environment!=='plain'&&environment!=='anti')||!pairKey||pairKey.length>200) throw new Error('missing env/sid capture identity');
+  var captureKey=pairKey+':'+environment;
+  if(captureKey.length>240) throw new Error('invalid captureKey');
+  var identityQuery=new URLSearchParams(); identityQuery.set('env',environment); identityQuery.set('sid',pairKey);
+  var result=await boundedJson('/api/fingerprint/build?'+identityQuery.toString(),{cache:'no-store'},10000,32768);
+  if(!result.response.ok) throw new Error('build '+result.response.status);
+  var payload=result.data, build=payload&&payload.browserCollectorBuild,
+    artifact=payload&&payload.browserCollectorArtifactSha256,
+    challenge=payload&&payload.serviceWorkerChallenge;
+  if(typeof build!=='string'||!/^[0-9a-f]{64}$/.test(build)) throw new Error('invalid browserCollectorBuild');
+  if(!/^[0-9a-f]{64}$/.test(EMBEDDED_COLLECTOR_BUILD)||build!==EMBEDDED_COLLECTOR_BUILD)
+    throw new Error('collector artifact/build mismatch');
+  if(!/^[0-9a-f]{64}$/.test(artifact||'')||artifact!==EMBEDDED_COLLECTOR_ARTIFACT_SHA256
+      ||LinkageProbe.sha256hex(COLLECTOR_SRC)!==EMBEDDED_COLLECTOR_ARTIFACT_SHA256)
+    throw new Error('collector source/artifact mismatch');
+  if(!validServiceWorkerToken(challenge)) throw new Error('invalid serviceWorkerChallenge');
+  var op=payload&&payload.crossOriginProbe, po, co, pe=op&&op.processEvidence;
+  try{po=new URL(op&&op.parentOrigin);co=new URL(op&&op.childOrigin);}
+  catch(_){throw new Error('invalid crossOriginProbe origins');}
+  if(po.origin!==(op&&op.parentOrigin)||co.origin!==(op&&op.childOrigin)||po.origin!==location.origin||po.origin===co.origin
+      ||!validRegistrableSite(op.registrableParentSite)||!validRegistrableSite(op.registrableChildSite)
+      ||op.registrableParentSite===op.registrableChildSite
+      ||!hostBelongsToSite(po.hostname,op.registrableParentSite)||!hostBelongsToSite(co.hostname,op.registrableChildSite)
+      ||typeof op.configurationId!=='string'||!op.configurationId
+      ||!pe||typeof pe!=='object'||Array.isArray(pe)
+      ||Object.prototype.hasOwnProperty.call(pe,'captureKey')
+      ||pe.collectorBuild!==build||pe.configurationId!==op.configurationId
+      ||pe.parentOrigin!==op.parentOrigin||pe.childOrigin!==op.childOrigin
+      ||pe.registrableParentSite!==op.registrableParentSite||pe.registrableChildSite!==op.registrableChildSite
+      ||typeof pe.parentProcessId!=='string'||!pe.parentProcessId
+      ||typeof pe.childProcessId!=='string'||!pe.childProcessId||pe.parentProcessId===pe.childProcessId
+      ||!/^[0-9a-f]{64}$/.test(op.processEvidenceSha256||'')
+      ||LinkageProbe.sha256hex(canonicalIdentityJson(pe))!==op.processEvidenceSha256
+      ||op.processEvidenceBuild!==build)
+    throw new Error('invalid crossOriginProbe evidence');
+  OOPIF_EXPECTATION={parentOrigin:po.origin,childOrigin:co.origin,
+    registrableParentSite:op.registrableParentSite,registrableChildSite:op.registrableChildSite,
+    configurationId:op.configurationId,processEvidenceSha256:op.processEvidenceSha256,
+    processEvidenceBuild:op.processEvidenceBuild};
+  RUN_IDENTITY={environment:environment,pairKey:pairKey,captureKey:captureKey,
+    collectorBuild:build,collectorArtifactSha256:artifact,
+    serviceWorkerChallenge:challenge,oopif:OOPIF_EXPECTATION};
+  return RUN_IDENTITY;
+}
 
 // Terminal-manifest bookkeeping (Codex v4.2 #5): every server ACK and every
 // realm's terminal status, so "готово" is only declared once the server has
@@ -1425,8 +2019,9 @@ function rstat(name,status,detail){ if(!REALM_STATUS[name]||REALM_STATUS[name].s
 // silently-swallowed failure was how a half-saved run looked "done". Callers that
 // must not hang still use .then(res,res); the failure is recorded in SENDLOG.
 function send(context,m){
-  return fetch(COLLECT_URL,{method:'POST',headers:{'content-type':'application/json'},
-    body:JSON.stringify({context:context,m:m})}).then(function(r){
+  if(!RUN_IDENTITY) return Promise.reject(new Error('capture identity not initialized'));
+  return boundedFetch(COLLECT_URL,{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({context:context,m:m,identity:RUN_IDENTITY})},15000).then(function(r){
       SENDLOG.push({context:context,ok:r.ok,status:r.status});
       if(!r.ok){ log('  ✗ '+context+' '+r.status,'err'); throw new Error('http-'+r.status); }
       log('  ✓ '+context+' ('+Object.keys(m).length+' параметров)','ok');
@@ -1436,6 +2031,31 @@ function send(context,m){
       log('  ✗ '+context+': '+(e&&e.message||e),'err');
       throw e;
     });
+}
+function createCompletionStateMachine(deps){
+  var state={permissionedAck:false,manifestAck:false}, inFlight=null;
+  function step(){
+    var permissionStep;
+    if(state.permissionedAck) permissionStep=Promise.resolve();
+    else permissionStep=deps.collectPermissioned().then(function(payload){
+      return deps.send('permissioned',payload);
+    }).then(function(){
+      state.permissionedAck=true;
+      if(deps.permissionedAcknowledged) deps.permissionedAcknowledged();
+    });
+    return permissionStep.then(function(){
+      if(state.manifestAck) return;
+      return deps.send('run-manifest',deps.buildManifest()).then(function(){state.manifestAck=true;});
+    }).then(function(){return deps.queryStatus();});
+  }
+  function run(){
+    if(inFlight)return inFlight;
+    var started;
+    try{started=step();}catch(e){started=Promise.reject(e);}
+    inFlight=Promise.resolve(started).then(function(value){inFlight=null;return value;},function(error){inFlight=null;throw error;});
+    return inFlight;
+  }
+  return {run:run,state:state};
 }
 function blobURL(src){ return URL.createObjectURL(new Blob([src],{type:'text/javascript'})); }
 
@@ -1462,19 +2082,49 @@ function viaWorker(kind){
   var shared = kind.indexOf('shared')===0;
   var module = /-module$/.test(kind);
   return new Promise(function(res){
-    var t=setTimeout(function(){ rstat(kind,'timeout'); log('  ! '+kind+' timeout','err'); res(); },20000);
+    var settled=false,t=null,url=null,w=null,port=null;
+    function cleanup(){
+      if(t!==null){clearTimeout(t);t=null;}
+      try{if(port){port.onmessage=null;port.onmessageerror=null;if(shared&&port.close)port.close();}}catch(_){}
+      try{if(w){w.onerror=null;if(w.terminate)w.terminate();}}catch(_){}
+      try{if(url)URL.revokeObjectURL(url);}catch(_){}
+    }
+    function fail(status,detail){
+      if(settled)return; settled=true; cleanup();
+      rstat(kind,status,detail||null); log('  ! '+kind+(detail?': '+detail:' '+status),'err'); res();
+    }
+    function received(data){
+      if(settled)return; settled=true; cleanup();
+      Promise.resolve().then(function(){return send(kind,data);}).then(
+        function(){rstat(kind,'finished');res();},
+        function(){rstat(kind,'error','send');res();}
+      );
+    }
     try{
-      var url=blobURL(COLLECTOR_SRC+'\n'+WORKER_SRC.replace(/__KIND__/g,kind));
+      url=blobURL(COLLECTOR_SRC+'\n'+WORKER_SRC.replace(/__KIND__/g,kind));
       var opts = module ? {type:'module'} : undefined;
-      var w = shared?new SharedWorker(url,opts):new Worker(url,opts);
-      var port = shared?(w.port.start(),w.port):w;
-      port.onmessage=function(e){ clearTimeout(t); if(w.terminate)w.terminate(); send(kind,e.data).then(function(){rstat(kind,'finished');res();},function(){rstat(kind,'error','send');res();}); };
+      w=shared?new SharedWorker(url,opts):new Worker(url,opts);
+      port=shared?(w.port.start(),w.port):w;
+      port.onmessage=function(e){received(e.data);};
+      port.onmessageerror=function(){fail('error','messageerror');};
+      w.onerror=function(e){fail('error',(e&&e.message)||'worker error');return true;};
+      // Full collector gives WebGPU 20s internally; the realm transport must
+      // leave headroom for serialization and postMessage of the resulting raw.
+      t=setTimeout(function(){fail('timeout','collector timeout');},30000);
       port.postMessage('go');
-    }catch(e){ clearTimeout(t); rstat(kind,'error',e.message); log('  ! '+kind+': '+e.message,'err'); res(); }
+    }catch(e){fail('error',e&&e.message);}
   });
 }
 function viaWorklet(){
   return (async function(){
+    var ac=null,n=null,moduleUrl=null,timer=null;
+    function cleanup(){
+      if(timer!==null){clearTimeout(timer);timer=null;}
+      try{if(n&&n.port){n.port.onmessage=null;n.port.onmessageerror=null;if(n.port.close)n.port.close();}}catch(_){}
+      try{if(n&&n.disconnect)n.disconnect();}catch(_){}
+      try{if(moduleUrl)URL.revokeObjectURL(moduleUrl);}catch(_){}
+      moduleUrl=null;
+    }
     try{
       // OfflineAudioContext, NOT a realtime AudioContext: a realtime context
       // opened without a user gesture stays 'suspended' (autoplay policy), its
@@ -1483,19 +2133,31 @@ function viaWorklet(){
       // Offline rendering runs deterministically with no gesture requirement.
       var OAC=window.OfflineAudioContext||window.webkitOfflineAudioContext;
       if(!OAC){ rstat('audio-worklet','unsupported','no OfflineAudioContext'); log('  ! audio-worklet: no OfflineAudioContext','err'); return; }
-      var ac=new OAC(1,128,44100);
-      await ac.audioWorklet.addModule(blobURL(WORKLET_SRC));
-      var n=new AudioWorkletNode(ac,'probe');
+      ac=new OAC(1,128,44100);
+      moduleUrl=blobURL(WORKLET_SRC);
+      await ac.audioWorklet.addModule(moduleUrl);
+      n=new AudioWorkletNode(ac,'probe');
       n.connect(ac.destination);
       var m=await new Promise(function(res,rej){
-        n.port.onmessage=function(e){res(e.data);};
-        n.port.postMessage('go');
-        ac.startRendering();               // drives the quantum → processor runs
-        setTimeout(function(){rej(new Error('timeout'));},12000);
+        var settled=false;
+        function finish(fn,value){if(settled)return;settled=true;if(timer!==null){clearTimeout(timer);timer=null;}fn(value);}
+        n.port.onmessage=function(e){finish(res,e.data);};
+        n.port.onmessageerror=function(){finish(rej,new Error('audio-worklet messageerror'));};
+        timer=setTimeout(function(){var error=new Error('audio-worklet timeout');error.name='TimeoutError';finish(rej,error);},12000);
+        try{n.port.postMessage('go');}
+        catch(error){finish(rej,error);return;}
+        // Observe the rendering promise: ignoring a rejection produces an
+        // unhandled rejection and leaves the harness waiting for a message that
+        // can no longer arrive.
+        var rendering;
+        try{rendering=ac.startRendering();}
+        catch(error){finish(rej,error);return;}
+        Promise.resolve(rendering).then(function(){},function(error){finish(rej,error);});
       });
-      try{ m._measurements=typifyWorklet(m,'audio-worklet'); m._schema='typed-v4-partial'; }catch(_){}
+      try{ m._measurements=typifyWorklet(m,'audio-worklet'); m._schema='typed-v4'; }catch(_){}
       await send('audio-worklet',m); rstat('audio-worklet','finished');
-    }catch(e){ rstat('audio-worklet', e&&e.message==='timeout'?'timeout':'error', e&&e.message); log('  ! audio-worklet: '+e.message,'err'); }
+    }catch(e){ rstat('audio-worklet', e&&e.name==='TimeoutError'?'timeout':'error', e&&e.message); log('  ! audio-worklet: '+e.message,'err'); }
+    finally{cleanup();}
   })();
 }
 
@@ -1515,7 +2177,7 @@ function viaIframeVariant(context, opts){
       // Delegate the Permissions-Policy features the probe measures so a
       // same-origin subframe can actually run them (WebGPU especially) instead of
       // a policy-blocked realm. Ignored for the opaque-origin sandboxed frame.
-      try{ ifr.setAttribute('allow','webgpu *; gamepad *; accelerometer *; gyroscope *; magnetometer *'); }catch(_){}
+      try{ ifr.setAttribute('allow','webgpu *; keyboard-map *; gamepad *; accelerometer *; gyroscope *; magnetometer *'); }catch(_){}
       if(opts.sandbox!=null) ifr.setAttribute('sandbox',opts.sandbox);
       if(opts.credentialless){ try{ ifr.credentialless=true; }catch(_){} }
       var meta='{_isolation:{context:"'+context+'",sandbox:'+(opts.sandbox!=null?JSON.stringify(opts.sandbox):'null')+',credentialless:'+(!!opts.credentialless)+',origin:(location&&location.origin)||"opaque"}}';
@@ -1538,10 +2200,19 @@ function viaIframeUrl(){
     try{
       var ifr=document.createElement('iframe');
       ifr.style.cssText='position:absolute;left:-9999px;width:120px;height:120px;border:0';
-      try{ ifr.setAttribute('allow','webgpu *; gamepad *; accelerometer *; gyroscope *; magnetometer *'); }catch(_){}
-      ifr.src='/fingerprint/frame';
+      try{ ifr.setAttribute('allow','webgpu *; keyboard-map *; gamepad *; accelerometer *; gyroscope *; magnetometer *'); }catch(_){}
+      var requestId=boundChildRequestId();
+      var expected=expectedBoundChild('iframe-url',requestId,location.origin);
+      var childUrl=bindChildUrl(new URL('/fingerprint/frame',location.origin),expected);
+      ifr.src=childUrl.pathname+childUrl.search;
       var t=setTimeout(function(){ cleanup(); rstat('iframe-url','timeout'); log('  ! iframe-url timeout','err'); res(); },30000);
-      function onmsg(e){ if(e&&e.source===ifr.contentWindow&&e.data&&e.data.__fp){ cleanup(); send('iframe-url',e.data.m).then(function(){rstat('iframe-url','finished');res();},function(){rstat('iframe-url','error','send');res();}); } }
+      function onmsg(e){
+        if(!e||e.source!==ifr.contentWindow||e.origin!==location.origin||!e.data||e.data.__fpBoundChild!==1)return;
+        var payload;
+        try{payload=validateBoundChildMessage(e,ifr,expected,location.origin);}
+        catch(error){cleanup();rstat('iframe-url','error',error.message);log('  ! iframe-url: '+error.message,'err');res();return;}
+        cleanup(); send('iframe-url',payload).then(function(){rstat('iframe-url','finished');res();},function(){rstat('iframe-url','error','send');res();});
+      }
       function cleanup(){ clearTimeout(t); window.removeEventListener('message',onmsg); try{ ifr.remove(); }catch(_){} }
       window.addEventListener('message',onmsg);
       document.body.appendChild(ifr);
@@ -1551,58 +2222,155 @@ function viaIframeUrl(){
 function viaSandboxedIframe(){ return viaIframeVariant('sandboxed-iframe',{sandbox:'allow-scripts'}); }        // opaque origin
 function viaCredentiallessIframe(){ return viaIframeVariant('credentialless-iframe',{sandbox:'allow-same-origin allow-scripts',credentialless:true}); }
 
-// service-worker: ещё один realm. SW отдаётся роутом /fingerprint/sw (тот же
-// COLLECTOR). У SW нет fetch-обработчика — трафик не перехватывает; после снятия
-// снимаем регистрацию. Отвечает на 'go' снимком через MessageChannel-порт.
+function serviceWorkerRequestId(){
+  if(!(crypto&&typeof crypto.getRandomValues==='function')) throw new Error('secure request id unavailable');
+  var bytes=new Uint8Array(16),out=''; crypto.getRandomValues(bytes);
+  for(var i=0;i<bytes.length;i++) out+=('0'+bytes[i].toString(16)).slice(-2);
+  return out;
+}
+function waitForActivatedRegistration(reg,timeoutMs){
+  return new Promise(function(resolve,reject){
+    var timer=null,observed=[];
+    function cleanup(){
+      if(timer!==null) clearTimeout(timer);
+      try{reg.removeEventListener('updatefound',check);}catch(_){}
+      observed.forEach(function(sw){try{sw.removeEventListener('statechange',check);}catch(_){}});
+    }
+    function observe(sw){
+      if(!sw||observed.indexOf(sw)>=0||typeof sw.addEventListener!=='function')return;
+      observed.push(sw); sw.addEventListener('statechange',check);
+    }
+    function check(){
+      observe(reg.installing); observe(reg.waiting); observe(reg.active);
+      if(reg.active&&reg.active.state==='activated'){var active=reg.active;cleanup();resolve(active);}
+    }
+    try{reg.addEventListener('updatefound',check);}catch(_){}
+    timer=setTimeout(function(){cleanup();reject(new Error('timeout'));},timeoutMs);
+    check();
+  });
+}
+function serviceWorkerRoundTrip(target,request,timeoutMs){
+  return new Promise(function(resolve,reject){
+    var channel=new MessageChannel(),port1=channel.port1,port2=channel.port2,timer=null,settled=false;
+    function cleanup(){
+      if(timer!==null) clearTimeout(timer);
+      try{port1.removeEventListener('message',onmessage);}catch(_){}
+      try{port1.removeEventListener('messageerror',onmessageerror);}catch(_){}
+      try{port1.close();}catch(_){} try{port2.close();}catch(_){}
+    }
+    function finish(fn,value){if(settled)return;settled=true;cleanup();fn(value);}
+    function onmessage(e){finish(resolve,e.data);}
+    function onmessageerror(){finish(reject,new Error('service-worker messageerror'));}
+    port1.addEventListener('message',onmessage);
+    port1.addEventListener('messageerror',onmessageerror);
+    try{port1.start();}catch(_){}
+    timer=setTimeout(function(){finish(reject,new Error('timeout'));},timeoutMs);
+    try{target.postMessage(request,[port2]);}catch(e){finish(reject,e);}
+  });
+}
+function validateServiceWorkerResponse(response,request,expected){
+  if(!response||typeof response!=='object'||Array.isArray(response)
+      ||response.type!=='fingerprint-service-worker-result'||response.handshakeVersion!==1
+      ||response.requestId!==request.requestId) throw new Error('invalid service-worker response envelope');
+  if(response.ok!==true){
+    var detail=response.error&&response.error.message; throw new Error('service-worker collection failed'+(detail?': '+detail:''));
+  }
+  var payload=response.payload,sw=payload&&payload._serviceWorker;
+  var ack=LinkageProbe.sha256hex(canonicalIdentityJson({context:'service-worker',
+    collectorBuild:expected.collectorBuild,collectorArtifactSha256:expected.collectorArtifactSha256,
+    captureKey:expected.captureKey,challenge:expected.challenge}));
+  if(!payload||typeof payload!=='object'||Array.isArray(payload)||payload._context!=='service-worker'
+      ||!sw||typeof sw!=='object'||sw.context!=='service-worker'
+      ||sw.collectorBuild!==expected.collectorBuild||sw.captureKey!==expected.captureKey
+      ||sw.collectorArtifactSha256!==expected.collectorArtifactSha256
+      ||sw.challenge!==expected.challenge||sw.acknowledgementSha256!==ack
+      ||sw.handshakeVersion!==1||sw.requestId!==request.requestId
+      ||sw.scriptURL!==expected.scriptURL||sw.scope!==expected.scope)
+    throw new Error('invalid service-worker readiness evidence');
+  return payload;
+}
+
+// Each capture gets a build/capture/challenge-bound script URL and a unique
+// scope. The exact activated worker from this registration is used directly;
+// the page never relies on another scope's global controller.
 function viaServiceWorker(){
   return (async function(){
     if(!('serviceWorker' in navigator)){ rstat('service-worker','unsupported','no serviceWorker'); log('  ! нет serviceWorker','err'); return; }
     var reg;
     try{
-      reg=await navigator.serviceWorker.register('/fingerprint/sw',{scope:'/fingerprint/'});
-      // дождаться активного воркера
-      var sw=reg.active||reg.waiting||reg.installing;
-      if(sw && sw.state!=='activated'){
-        await new Promise(function(res){ var t=setTimeout(res,8000); sw.addEventListener('statechange',function(){ if(sw.state==='activated'){ clearTimeout(t); res(); } }); });
-      }
-      var target=reg.active||navigator.serviceWorker.controller;
-      if(!target){ rstat('service-worker','timeout','not activated'); log('  ! SW не активировался','err'); try{await reg.unregister();}catch(_){}; return; }
-      var m=await new Promise(function(res,rej){
-        var ch=new MessageChannel();
-        ch.port1.onmessage=function(e){ res(e.data); };
-        target.postMessage('go',[ch.port2]);
-        setTimeout(function(){ rej(new Error('timeout')); },15000);
-      });
+      if(!RUN_IDENTITY||!validServiceWorkerToken(RUN_IDENTITY.serviceWorkerChallenge))
+        throw new Error('capture identity not initialized for service-worker');
+      var challenge=RUN_IDENTITY.serviceWorkerChallenge;
+      var swUrl=new URL('/fingerprint/sw',location.origin);
+      swUrl.searchParams.set('build',RUN_IDENTITY.collectorBuild);
+      swUrl.searchParams.set('artifact',RUN_IDENTITY.collectorArtifactSha256);
+      swUrl.searchParams.set('capture',RUN_IDENTITY.captureKey);
+      swUrl.searchParams.set('challenge',challenge);
+      var scopePath='/fingerprint/sw-scope/'+challenge+'/',expectedScope=new URL(scopePath,location.origin).href;
+      reg=await navigator.serviceWorker.register(swUrl.pathname+swUrl.search,{scope:scopePath,updateViaCache:'none'});
+      if(reg.scope!==expectedScope||reg.updateViaCache!=='none') throw new Error('service-worker registration binding mismatch');
+      var target=await waitForActivatedRegistration(reg,12000);
+      if(target!==reg.active||target.state!=='activated'||target.scriptURL!==swUrl.href)
+        throw new Error('service-worker activation binding mismatch');
+      var requestId=serviceWorkerRequestId();
+      var request={type:'fingerprint-service-worker-collect',handshakeVersion:1,requestId:requestId,
+        context:'service-worker',collectorBuild:RUN_IDENTITY.collectorBuild,
+        collectorArtifactSha256:RUN_IDENTITY.collectorArtifactSha256,
+        captureKey:RUN_IDENTITY.captureKey,challenge:challenge};
+      // collect() gives each parallel job up to 20s; the transport deadline must
+      // sit above that cap or a slow-but-valid GPU job is killed first.
+      var response=await serviceWorkerRoundTrip(target,request,30000);
+      var m=validateServiceWorkerResponse(response,request,{collectorBuild:RUN_IDENTITY.collectorBuild,
+        collectorArtifactSha256:RUN_IDENTITY.collectorArtifactSha256,
+        captureKey:RUN_IDENTITY.captureKey,challenge:challenge,scriptURL:swUrl.href,scope:expectedScope});
       await send('service-worker',m); rstat('service-worker','finished');
     }catch(e){ rstat('service-worker', e&&e.message==='timeout'?'timeout':'error', e&&e.message); log('  ! service-worker: '+e.message,'err'); }
     finally{ try{ if(reg) await reg.unregister(); }catch(_){} }
   })();
 }
 
-// cross-origin OOPIF: iframe на fp-origin (/xprobe у приёмника) — настоящий
-// другой сайт. Страница гоняет тот же COLLECTOR и постит нам результат.
+// Cross-site iframe on the capture origin. The page verifies origin/configuration;
+// the separate automated Chrome/CDP smoke supplies build-level renderer-process
+// evidence. A manual page cannot observe process IDs and does not pretend to.
 function viaCrossOrigin(){
   return (async function(){
     var ifr;
     try{
-      var r=await fetch('/api/fingerprint/xprobe-url'); if(!r.ok){ rstat('cross-origin-iframe','unsupported','not deployed ('+r.status+')'); return; } // 503 = не развёрнут
-      var j=await r.json(); if(!j.url){ rstat('cross-origin-iframe','unsupported','no url'); return; }
+      var xr=await boundedJson('/api/fingerprint/xprobe-url',{cache:'no-store'},10000,16384), r=xr.response;
+      if(!r.ok){ rstat('cross-origin-iframe','unsupported','not deployed ('+r.status+')'); return; } // 503 = не развёрнут
+      var j=xr.data; if(!j.url){ rstat('cross-origin-iframe','unsupported','no url'); return; }
       ifr=document.createElement('iframe');
       ifr.style.cssText='position:absolute;left:-9999px;width:120px;height:120px;border:0';
-      try{ ifr.setAttribute('allow','webgpu *; gamepad *; accelerometer *; gyroscope *; magnetometer *'); }catch(_){}
-      ifr.src=j.url;
+      try{ ifr.setAttribute('allow','webgpu *; keyboard-map *; gamepad *; accelerometer *; gyroscope *; magnetometer *'); }catch(_){}
       // Expected child origin from the returned URL — verify event.origin against
-      // it and record BOTH origins (Codex v4.3 #9): a true cross-site OOPIF.
-      var childOrigin=''; try{ childOrigin=new URL(j.url).origin; }catch(_){}
+      // it and record both origins plus the accepted deployment-evidence binding.
+      var childUrl=null,childOrigin=''; try{childUrl=new URL(j.url);childOrigin=childUrl.origin;}catch(_){}
+      if(!childUrl||childUrl.username||childUrl.password||childUrl.search||childUrl.hash||childUrl.pathname!=='/xprobe'
+          ||!OOPIF_EXPECTATION||childOrigin!==OOPIF_EXPECTATION.childOrigin
+          ||j.configurationId!==OOPIF_EXPECTATION.configurationId) throw new Error('xprobe configuration mismatch');
+      var requestId=boundChildRequestId();
+      var expected=expectedBoundChild('cross-origin-iframe',requestId,location.origin);
+      childUrl=bindChildUrl(childUrl,expected);
+      ifr.src=childUrl.href;
       var m=await new Promise(function(res,rej){
         var done=false;
         function onmsg(e){
           // must come from OUR iframe AND from the expected cross-site origin.
-          if(e&&e.source===ifr.contentWindow&&e.origin===childOrigin&&e.data&&e.data.__fpx){
+          if(e&&e.source===ifr.contentWindow&&e.origin===childOrigin&&e.data&&e.data.__fpBoundChild===1){
             done=true; clearTimeout(tmo); window.removeEventListener('message',onmsg);
-            var data=e.data.m||{};
-            try{ data._crossOrigin={ parentOrigin:location.origin, childOrigin:e.origin, eventOriginVerified:true,
-              crossSite:(function(){ try{ return new URL(location.origin).hostname.split('.').slice(-2).join('.')!==new URL(e.origin).hostname.split('.').slice(-2).join('.'); }catch(_){ return null; } })() }; }catch(_){}
+            var data;
+            try{data=validateBoundChildMessage(e,ifr,expected,childOrigin);}
+            catch(error){rej(error);return;}
+            try{ data._crossOrigin={parentOrigin:OOPIF_EXPECTATION.parentOrigin,childOrigin:e.origin,
+              registrableParentSite:OOPIF_EXPECTATION.registrableParentSite,
+              registrableChildSite:OOPIF_EXPECTATION.registrableChildSite,
+              eventOriginVerified:true,crossSiteConfigured:true,configurationId:OOPIF_EXPECTATION.configurationId,
+              processEvidenceSha256:OOPIF_EXPECTATION.processEvidenceSha256,
+              processEvidenceBuild:OOPIF_EXPECTATION.processEvidenceBuild,
+              collectorBuild:expected.collectorBuild,
+              collectorArtifactSha256:expected.collectorArtifactSha256,
+              captureKey:expected.captureKey,requestId:expected.requestId,
+              acknowledgementSha256:expected.acknowledgementSha256}; }catch(_){}
             res(data);
           }
         }
@@ -1616,44 +2384,46 @@ function viaCrossOrigin(){
   })();
 }
 
-// Сетевой слой (JA4): дёргаем приёмник из ЭТОЙ же вкладки — само TLS-рукопожатие
-// к нему и есть замер. Токен просим у панели (тот же origin), приёмник кросс-
-// оригинный, поэтому no-cors: ответ не читаем, но соединение и запрос уходят.
+// Сетевой слой (JA4 + HTTP/2): дёргаем приёмник из ЭТОЙ же вкладки — само
+// TLS-рукопожатие и H2 preface являются замером. Приёмник отвечает с CORS, чтобы
+// `fetch` мог отличить подтверждённый 2xx (запись уже сохранена панелью) от 502
+// или сетевой ошибки. Просто "запрос был отправлен" завершением не считается.
 async function netLayer(){
   try{
     var qs=new URLSearchParams(location.search);
     var env=qs.get('env'), sid=qs.get('sid');
     if(!env) return;
-    // Two-phase Accept-CH/Critical-CH (Codex v4.3 #8): round 1 primes (server sends
-    // Accept-CH); after a short gap the browser has cached it, so round 2 carries
-    // the high-entropy hints. Each round is its own TLS connection → own JA4.
+    // Mint one one-time token. Round 1 does not persist/consume it; round 2 uses
+    // the same token for the one canonical record, so priming cannot leak an
+    // abandoned token in the panel database.
+    var tokUrl='/api/fingerprint/net-token?env='+encodeURIComponent(env)+(sid?'&sid='+encodeURIComponent(sid):'')+'&round=2';
+    var tokenResult=await boundedJson(tokUrl,{method:'POST'},10000,16384), tokenResponse=tokenResult.response;
+    if(!tokenResponse.ok) throw new Error('net-token '+tokenResponse.status);
+    var tokenPayload=tokenResult.data;
+    if(!tokenPayload.url) throw new Error('net-token: no url');
+    // Two-phase Accept-CH: round 1 only primes the browser; round 2 carries the
+    // high-entropy hints and is the ONE persisted network record. Each response
+    // resolves only after the capture server has received the panel save ACK.
     async function fireRound(round){
-      var tokUrl='/api/fingerprint/net-token?env='+encodeURIComponent(env)+(sid?'&sid='+encodeURIComponent(sid):'')+'&round='+round;
-      var r=await fetch(tokUrl,{method:'POST'});
-      if(!r.ok){ if(round===1) rstat('network','unsupported','net-token '+r.status); return false; }
-      var j=await r.json(); if(!j.url){ if(round===1) rstat('network','unsupported','no url'); return false; }
-      await new Promise(function(res){
-        var done=false, fin=function(){ if(done)return; done=true; res(); };
-        try{ fetch(j.url,{mode:'no-cors',cache:'no-store'}).then(fin,fin); }catch(e){ fin(); }
-        setTimeout(fin,8000);
-      });
+      var captureUrl=new URL(tokenPayload.url);
+      captureUrl.searchParams.set('round',String(round));
+      var ctrl=typeof AbortController==='function'?new AbortController():null;
+      var timer=setTimeout(function(){ try{ if(ctrl)ctrl.abort(); }catch(_){} },12000);
+      var captured;
+      try{
+        captured=await fetch(captureUrl.toString(),{mode:'cors',cache:'no-store',signal:ctrl?ctrl.signal:undefined});
+      }finally{ clearTimeout(timer); }
+      if(!captured.ok) throw new Error('capture round '+round+' '+captured.status);
       return true;
     }
-    var ok1=await fireRound(1);
-    if(!ok1) return;
+    await fireRound(1);
     await new Promise(function(r){ setTimeout(r,1500); });   // let the browser cache Accept-CH
     await fireRound(2);
-    // no-cors: the ack lands server→server (capture → panel); the server confirms
-    // persistence in the side-status check before "готово".
-    rstat('network','fired');
-    log('  ✓ сетевой слой (JA4, 2-phase Accept-CH)','ok');
+    rstat('network','finished');
+    log('  ✓ сетевой ответ сохранён; строгий валидатор отдельно проверит net-v6, JA4 и H2','ok');
   }catch(e){ rstat('network','error', e&&e.message); }
 }
 
-// Permissioned phase (optional, gesture-gated): geo / device labels / permission
-// states behind browser prompts. Never blocks the passive snapshot. Geo is kept
-// privacy-safe — accuracy + permission state + a HASH of coarse coords (so admin
-// can see if location differs plain-vs-anti WITHOUT storing the real address).
 // Permissioned phase (gesture-gated), rebuilt per Codex v4.2 #8:
 //  · permission STATES before AND after (a `prompt` is NOT `granted`);
 //  · a REAL getUserMedia({audio,video}) prompt, then per-track settings/
@@ -1664,9 +2434,63 @@ async function netLayer(){
 //    speed/timestamp) with a coarse bucket kept only as an extra human field;
 //  · a manifest reconciling requested vs granted/denied/prompt/timeout/unsupported,
 //    with `complete` only when every requested step reached a terminal state.
+var ACTIVE_MEDIA_STREAMS=[];
+var PENDING_MEDIA_REQUESTS=[];
+var MEDIA_PAGE_HIDDEN=false;
+function stopMediaStream(stream){
+  var tracks=[];
+  try{ tracks=stream&&stream.getTracks?stream.getTracks():[]; }catch(_){}
+  tracks.forEach(function(track){ try{track.stop();}catch(_){} });
+}
+function releaseMediaStream(stream){
+  for(var i=ACTIVE_MEDIA_STREAMS.length-1;i>=0;i--) if(ACTIVE_MEDIA_STREAMS[i]===stream) ACTIVE_MEDIA_STREAMS.splice(i,1);
+  stopMediaStream(stream);
+}
+function releaseAllMediaStreams(){
+  var streams=ACTIVE_MEDIA_STREAMS.slice(); ACTIVE_MEDIA_STREAMS.length=0;
+  streams.forEach(stopMediaStream);
+}
+function abortPendingMediaRequests(){
+  var pending=PENDING_MEDIA_REQUESTS.slice(); PENDING_MEDIA_REQUESTS.length=0;
+  pending.forEach(function(entry){try{entry.abort();}catch(_){}});
+}
+function requestUserMediaWithTimeout(constraints,timeoutMs){
+  return new Promise(function(resolve,reject){
+    var settled=false;
+    var pending={abort:function(){
+      var error=new Error('page hidden while getUserMedia was pending'); error.name='AbortError';
+      finish(reject,error);
+    }};
+    function removePending(){
+      for(var i=PENDING_MEDIA_REQUESTS.length-1;i>=0;i--)if(PENDING_MEDIA_REQUESTS[i]===pending)PENDING_MEDIA_REQUESTS.splice(i,1);
+    }
+    function finish(fn,value){
+      if(settled)return false;settled=true;clearTimeout(timer);removePending();fn(value);return true;
+    }
+    var timer=setTimeout(function(){
+      var error=new Error('timeout'); error.name='TimeoutError'; finish(reject,error);
+    },timeoutMs);
+    PENDING_MEDIA_REQUESTS.push(pending);
+    if(MEDIA_PAGE_HIDDEN){pending.abort();return;}
+    var request;
+    try{request=navigator.mediaDevices.getUserMedia(constraints);}
+    catch(error){finish(reject,error);return;}
+    Promise.resolve(request).then(function(stream){
+      if(settled||MEDIA_PAGE_HIDDEN){ stopMediaStream(stream); if(!settled)pending.abort(); return; }
+      ACTIVE_MEDIA_STREAMS.push(stream);
+      if(!finish(resolve,stream))releaseMediaStream(stream);
+    },function(error){
+      finish(reject,error);
+    });
+  });
+}
+if(typeof window!=='undefined'&&window.addEventListener){
+  window.addEventListener('pagehide',function(){ MEDIA_PAGE_HIDDEN=true; abortPendingMediaRequests(); releaseAllMediaStreams(); });
+  window.addEventListener('pageshow',function(){ MEDIA_PAGE_HIDDEN=false; });
+}
 function permissionedCollect(){
   return (async function(){
-    var out={ _context:'permissioned', _schema:'typed-v4-partial' };
+    var out={ _context:'permissioned', _schema:'typed-v4' };
     var recs=[];
     var manifest={ phase:'permissioned', requested:[], granted:[], denied:[], prompt:[], timeout:[], unsupported:[], steps:{}, complete:false };
     var enc=(self.LinkageProbe&&self.LinkageProbe.encodeValue)||function(v){return {valueType:typeof v,value:v};};
@@ -1702,11 +2526,9 @@ function permissionedCollect(){
     manifest.requested.push('getUserMedia');
     var gumState='unsupported';
     if(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia){
+      var stream=null;
       try{
-        var stream=await new Promise(function(resolve,reject){
-          var t=setTimeout(function(){reject(new Error('timeout'));},20000);
-          navigator.mediaDevices.getUserMedia({audio:true,video:true}).then(function(s){clearTimeout(t);resolve(s);},function(e){clearTimeout(t);reject(e);});
-        });
+        stream=await requestUserMediaWithTimeout({audio:true,video:true},20000);
         gumState='granted'; manifest.granted.push('getUserMedia');
         stream.getTracks().forEach(function(tr,idx){
           rec('permissioned.track['+idx+'].kind','ok',tr.kind);
@@ -1714,7 +2536,6 @@ function permissionedCollect(){
           try{ rec('permissioned.track['+idx+'].settings','ok', tr.getSettings?tr.getSettings():null); }catch(e){}
           try{ rec('permissioned.track['+idx+'].capabilities','ok', tr.getCapabilities?tr.getCapabilities():null); }catch(e){}
           try{ rec('permissioned.track['+idx+'].constraints','ok', tr.getConstraints?tr.getConstraints():null); }catch(e){}
-          try{ tr.stop(); }catch(e){}                    // release camera/mic
         });
       }catch(e){
         var nm=e&&e.name;
@@ -1722,7 +2543,7 @@ function permissionedCollect(){
         else if(e&&e.message==='timeout'){ gumState='timeout'; manifest.timeout.push('getUserMedia'); rec('permissioned.getUserMedia','timeout',null); }
         else if(nm==='NotFoundError'||nm==='OverconstrainedError'){ gumState='no-device'; manifest.unsupported.push('getUserMedia'); rec('permissioned.getUserMedia','unavailable-in-context',null,{name:nm,message:e.message}); }
         else { gumState='error'; rec('permissioned.getUserMedia','error',null,{name:nm,message:e&&e.message}); }
-      }
+      }finally{ if(stream)releaseMediaStream(stream); }
     } else { manifest.unsupported.push('getUserMedia'); rec('permissioned.getUserMedia','unavailable-in-context',null); }
     rec('permissioned.getUserMedia.result','ok',gumState); manifest.steps.getUserMedia=gumState;
 
@@ -1774,6 +2595,8 @@ function permissionedCollect(){
 
 (async function(){
   log('идёт сбор…','big');
+  try{ await initRunIdentity(); }
+  catch(e){ log('не удалось начать строгий замер: '+(e&&e.message||e),'err'); return; }
   try{ await send('main-frame', await LinkageProbe.collect('main-frame')); rstat('main-frame','finished'); }catch(e){ rstat('main-frame','error',e.message); log('main-frame: '+e.message,'err'); }
   await viaWorker('dedicated-worker');
   await viaWorker('dedicated-worker-module');
@@ -1800,8 +2623,8 @@ function permissionedCollect(){
   btn.style.cssText='padding:10px 16px;font:14px system-ui;cursor:pointer';
   // Every realm the run attempts. The terminal manifest records a status for each
   // (finished/timeout/blocked/unsupported/error) — presence of one line is NOT
-  // completion (Codex v4.2 #5). credentialless-iframe is Chrome-only, so it's
-  // expected-optional and doesn't block "готово" when unsupported.
+  // completion. This Chrome-first build uses one exact server-owned 14-context
+  // matrix; no browser capability report is allowed to shrink it.
   var EXPECTED=['main-frame','dedicated-worker','dedicated-worker-module','shared-worker','shared-worker-module',
     'audio-worklet','iframe','iframe-url','sandboxed-iframe','credentialless-iframe','service-worker','cross-origin-iframe','network','permissioned'];
   function buildManifest(){
@@ -1813,32 +2636,35 @@ function permissionedCollect(){
       else if(acks[r]&&acks[r].ok) realms[r]={status:'finished'};
       else realms[r]={status:'missing'};
     });
-    return { _context:'run-manifest', expected:EXPECTED, realms:realms, acks:acks, sendLog:SENDLOG,
+    return { _context:'run-manifest', expected:EXPECTED, realms:realms, acks:acks, sendLog:SENDLOG, identity:RUN_IDENTITY,
       builtAt:(new Date()).toISOString(), collectorVersion:(self.LinkageProbe&&self.LinkageProbe.version)||null };
   }
+  function querySideStatus(){
+    var qs=new URLSearchParams(location.search), env=qs.get('env'), sid=qs.get('sid');
+    if(!env||!sid) return Promise.resolve(null);
+    return boundedJson('/api/fingerprint/side-status?env='+encodeURIComponent(env)+'&sid='+encodeURIComponent(sid),{cache:'no-store'},10000,65536)
+      .then(function(result){ if(!result.response.ok) throw new Error('side-status '+result.response.status); return result.data; });
+  }
+  var completion=createCompletionStateMachine({
+    collectPermissioned:permissionedCollect,
+    send:send,
+    buildManifest:buildManifest,
+    queryStatus:querySideStatus,
+    permissionedAcknowledged:function(){rstat('permissioned','finished');}
+  });
   function finishAndReport(){
-    // Post the terminal manifest, then ASK THE SERVER whether every canonically
-    // expected context (incl. the persisted network record) actually landed —
-    // «готово» requires the server's confirmation, not the client's own manifest
-    // (Codex v4.3 #1). A landed first line is never "done".
-    var man=buildManifest();
-    return send('run-manifest', man).then(function(){
-      var qs=new URLSearchParams(location.search), env=qs.get('env'), sid=qs.get('sid');
-      if(!env||!sid){ log('готово локально (сессия без env/sid — НЕ боевой снимок)','err'); return false; }
-      return fetch('/api/fingerprint/side-status?env='+encodeURIComponent(env)+'&sid='+encodeURIComponent(sid),{cache:'no-store'})
-        .then(function(r){ if(!r.ok) throw new Error('side-status '+r.status); return r.json(); })
-        .then(function(st){
-          if(st&&st.complete){ log('готово — сервер подтвердил полный сбор этой стороны ('+(st.present?st.present.length:'?')+' контекстов), можно закрывать вкладку','big'); return true; }
-          log('сбор записан, но сервер НЕ подтвердил полноту — не хватает: '+((st&&st.missing)||[]).join(', ')+' — это НЕ боевой снимок','err'); return false;
-        });
+    // ACK flags survive validator NOT_READY, HTTP 500 and timeout. A retry then
+    // performs only this status query; acknowledged payloads are never duplicated.
+    return completion.run().then(function(st){
+      if(st===null){ log('готово локально (сессия без env/sid — НЕ боевой снимок)','err'); return false; }
+      if(st&&st.ready===true&&st.overall==='READY'){ log('готово — строгий валидатор подтвердил полный сбор этой стороны ('+(st.present?st.present.length:'?')+' контекстов), можно закрывать вкладку','big'); return true; }
+      var why=(st&&Array.isArray(st.issues))?st.issues.map(function(x){return x.code+(x.context?':'+x.context:'');}).join(', '):'нет строгого verdict';
+      log('сбор записан, но строгий валидатор вернул NOT_READY: '+why+' — это НЕ боевой снимок','err'); return false;
     });
   }
-  btn.onclick=function(){ btn.disabled=true; btn.textContent='снимаю…';
-    permissionedCollect().then(function(m){ return send('permissioned',m); }).then(function(){
-      rstat('permissioned','finished');
-      btn.textContent='записываю итог…';
-      return finishAndReport();
-    }).then(function(serverConfirmed){
+  btn.onclick=function(){ btn.disabled=true;
+    btn.textContent=completion.state.permissionedAck?'проверяю статус…':'снимаю…';
+    finishAndReport().then(function(serverConfirmed){
       btn.textContent = serverConfirmed ? '✓ готово (подтверждено сервером)' : 'сбор неполный — см. лог, нажми ещё раз';
       if(!serverConfirmed) btn.disabled=false;
     }, function(e){

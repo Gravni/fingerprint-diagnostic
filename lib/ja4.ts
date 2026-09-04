@@ -11,6 +11,7 @@
 // cert (a synthetic ClientHello in the test only checks the assembly logic).
 
 import { createHash } from "node:crypto";
+import { md5hex } from "./md5.mjs";
 
 /** GREASE values (RFC 8701) are random padding a client sends to keep the
  *  ecosystem flexible; they must be stripped everywhere or the fingerprint is
@@ -28,6 +29,8 @@ export interface ClientHello {
   extensions: number[];     // in wire order, GREASE included
   sni: string | null;
   alpn: string[];
+  /** Exact ALPN protocol bytes. JA4 must not round-trip these through Unicode. */
+  alpnRaw: number[][];
   sigAlgs: number[];        // signature_algorithms, in wire order
   curves: number[];         // supported_groups (ext 0x000a), wire order, GREASE incl.
   pointFormats: number[];   // ec_point_formats (ext 0x000b), wire order
@@ -41,13 +44,25 @@ export interface ClientHello {
 function reassembleHandshake(buf: Buffer): Buffer | null {
   if (buf.length < 5 || buf[0] !== 0x16) return null;
   const frags: Buffer[] = [];
-  let p = 0;
-  while (p + 5 <= buf.length && buf[p] === 0x16) {
+  let p = 0, total = 0, wanted: number | null = null;
+  while (p < buf.length) {
+    if (p + 5 > buf.length || buf[p] !== 0x16) return null;
     const recLen = buf.readUInt16BE(p + 3);
-    frags.push(buf.subarray(p + 5, Math.min(p + 5 + recLen, buf.length)));
+    const recEnd = p + 5 + recLen;
+    // Never accept a partial TLS record. The previous implementation used
+    // Math.min(), which could turn a truncated packet into a plausible hello.
+    if (recEnd > buf.length) return null;
+    const frag = buf.subarray(p + 5, recEnd);
+    frags.push(frag); total += frag.length;
+    if (wanted === null && total >= 4) {
+      const prefix = Buffer.concat(frags, total);
+      if (prefix[0] !== 0x01) return null;
+      wanted = 4 + prefix.readUIntBE(1, 3);
+    }
+    if (wanted !== null && total >= wanted) return Buffer.concat(frags, total).subarray(0, wanted);
     p += 5 + recLen;
   }
-  return frags.length ? Buffer.concat(frags) : null;
+  return null;
 }
 
 /** True once the full ClientHello handshake message has arrived across however
@@ -68,79 +83,108 @@ export function parseClientHello(buf: Buffer): ClientHello | null {
     const tlsRecordVersion = buf.readUInt16BE(1);
     const hs = reassembleHandshake(buf);
     if (!hs) return null;
-    // Re-wrap the reassembled handshake as a single synthetic record so the parse
-    // offsets below (record header at 0, handshake at 5) stay unchanged.
-    buf = Buffer.concat([Buffer.from([0x16, buf[1], buf[2], (hs.length >> 8) & 0xff, hs.length & 0xff]), hs]);
-    let p = 5;
+    if (hs.length < 4 || hs[0] !== 0x01 || hs.readUIntBE(1, 3) !== hs.length - 4) return null;
+    let p = 4;
+    const end = hs.length;
+    const need = (n: number) => p + n <= end;
 
-    // Handshake header: type(1)=0x01 ClientHello, length(3)
-    if (buf[p] !== 0x01) return null;
-    p += 4;
-
-    const handshakeVersion = buf.readUInt16BE(p); p += 2;
+    if (!need(2 + 32 + 1)) return null;
+    const handshakeVersion = hs.readUInt16BE(p); p += 2;
     p += 32; // random
 
-    const sidLen = buf[p]; p += 1 + sidLen;
+    const sidLen = hs[p++];
+    if (!need(sidLen + 2)) return null;
+    p += sidLen;
 
-    const cipherLen = buf.readUInt16BE(p); p += 2;
+    const cipherLen = hs.readUInt16BE(p); p += 2;
+    if ((cipherLen & 1) !== 0 || !need(cipherLen + 1)) return null;
     const ciphers: number[] = [];
-    for (let i = 0; i < cipherLen; i += 2) ciphers.push(buf.readUInt16BE(p + i));
+    for (let i = 0; i < cipherLen; i += 2) ciphers.push(hs.readUInt16BE(p + i));
     p += cipherLen;
 
-    const compLen = buf[p]; p += 1 + compLen;
+    const compLen = hs[p++];
+    if (!need(compLen)) return null;
+    p += compLen;
 
     const out: ClientHello = {
       tlsRecordVersion, handshakeVersion,
       supportedVersionMax: null,
-      ciphers, extensions: [], sni: null, alpn: [], sigAlgs: [], curves: [], pointFormats: [],
+      ciphers, extensions: [], sni: null, alpn: [], alpnRaw: [], sigAlgs: [], curves: [], pointFormats: [],
     };
 
-    if (p + 2 > buf.length) return out; // no extensions block
-    const extTotal = buf.readUInt16BE(p); p += 2;
-    const extEnd = Math.min(p + extTotal, buf.length);
+    if (p === end) return out; // old TLS ClientHello with no extensions block
+    if (!need(2)) return null;
+    const extTotal = hs.readUInt16BE(p); p += 2;
+    if (p + extTotal !== end) return null;
+    const extEnd = p + extTotal;
 
-    while (p + 4 <= extEnd) {
-      const type = buf.readUInt16BE(p);
-      const len = buf.readUInt16BE(p + 2);
+    while (p < extEnd) {
+      if (p + 4 > extEnd) return null;
+      const type = hs.readUInt16BE(p);
+      const len = hs.readUInt16BE(p + 2);
       const body = p + 4;
+      const bodyEnd = body + len;
+      if (bodyEnd > extEnd) return null;
       out.extensions.push(type);
 
-      if (type === 0x0000 && len >= 5) {
-        // server_name: list(2) + type(1) + name_len(2) + name
-        const nameLen = buf.readUInt16BE(body + 3);
-        out.sni = buf.toString("ascii", body + 5, body + 5 + nameLen);
-      } else if (type === 0x0010 && len >= 2) {
-        // ALPN: list_len(2) then [len(1) proto]...
+      if (type === 0x0000) {
+        if (len < 2) return null;
+        const listLen = hs.readUInt16BE(body);
+        if (listLen !== len - 2) return null;
         let q = body + 2;
-        const listEnd = body + len;
-        while (q < listEnd) {
-          const l = buf[q]; q += 1;
-          out.alpn.push(buf.toString("ascii", q, q + l)); q += l;
+        while (q < bodyEnd) {
+          if (q + 3 > bodyEnd) return null;
+          const nameType = hs[q++], nameLen = hs.readUInt16BE(q); q += 2;
+          if (q + nameLen > bodyEnd) return null;
+          if (nameType === 0 && out.sni === null) out.sni = hs.toString("ascii", q, q + nameLen);
+          q += nameLen;
         }
-      } else if (type === 0x002b && len >= 1) {
+      } else if (type === 0x0010) {
+        // ALPN: list_len(2) then [len(1) proto]...
+        if (len < 2) return null;
+        const listLen = hs.readUInt16BE(body);
+        if (listLen !== len - 2) return null;
+        let q = body + 2;
+        while (q < bodyEnd) {
+          const l = hs[q++];
+          if (l === 0 || q + l > bodyEnd) return null;
+          const raw = [...hs.subarray(q, q + l)];
+          out.alpnRaw.push(raw);
+          out.alpn.push(Buffer.from(raw).toString("latin1"));
+          q += l;
+        }
+      } else if (type === 0x002b) {
         // supported_versions: list_len(1) then versions(2 each)
-        const n = buf[body];
+        if (len < 1) return null;
+        const n = hs[body];
+        if (n !== len - 1 || (n & 1) !== 0) return null;
         let best = 0;
         for (let i = 0; i < n; i += 2) {
-          const v = buf.readUInt16BE(body + 1 + i);
+          const v = hs.readUInt16BE(body + 1 + i);
           if (!isGrease(v) && v > best) best = v;
         }
         if (best) out.supportedVersionMax = best;
-      } else if (type === 0x000d && len >= 2) {
+      } else if (type === 0x000d) {
         // signature_algorithms: list_len(2) then algs(2 each)
-        const n = buf.readUInt16BE(body);
-        for (let i = 0; i < n && body + 2 + i + 1 < extEnd; i += 2) out.sigAlgs.push(buf.readUInt16BE(body + 2 + i));
-      } else if (type === 0x000a && len >= 2) {
+        if (len < 2) return null;
+        const n = hs.readUInt16BE(body);
+        if (n !== len - 2 || (n & 1) !== 0) return null;
+        for (let i = 0; i < n; i += 2) out.sigAlgs.push(hs.readUInt16BE(body + 2 + i));
+      } else if (type === 0x000a) {
         // supported_groups / elliptic_curves: list_len(2) then curves(2 each).
         // Omitting this made JA3 field 4 always empty → never matched real JA3.
-        const n = buf.readUInt16BE(body);
-        for (let i = 0; i < n && body + 2 + i + 1 < extEnd; i += 2) out.curves.push(buf.readUInt16BE(body + 2 + i));
-      } else if (type === 0x000b && len >= 1) {
+        if (len < 2) return null;
+        const n = hs.readUInt16BE(body);
+        if (n !== len - 2 || (n & 1) !== 0) return null;
+        for (let i = 0; i < n; i += 2) out.curves.push(hs.readUInt16BE(body + 2 + i));
+      } else if (type === 0x000b) {
         // ec_point_formats: list_len(1) then formats(1 each). JA3 field 5.
-        const n = buf[body];
-        for (let i = 0; i < n && body + 1 + i < extEnd; i += 1) out.pointFormats.push(buf[body + 1 + i]);
+        if (len < 1) return null;
+        const n = hs[body];
+        if (n !== len - 1) return null;
+        for (let i = 0; i < n; i += 1) out.pointFormats.push(hs[body + 1 + i]);
       }
-      p = body + len;
+      p = bodyEnd;
     }
     return out;
   } catch {
@@ -150,9 +194,10 @@ export function parseClientHello(buf: Buffer): ClientHello | null {
 
 const VER: Record<number, string> = {
   0x0304: "13", 0x0303: "12", 0x0302: "11", 0x0301: "10", 0x0300: "s3",
+  0x0002: "s2", 0xfeff: "d1", 0xfefd: "d2", 0xfefc: "d3",
 };
 function verStr(ch: ClientHello): string {
-  const v = ch.supportedVersionMax ?? ch.handshakeVersion;
+  const v = ch.supportedVersionMax ?? ch.tlsRecordVersion;
   return VER[v] ?? "00";
 }
 
@@ -173,17 +218,30 @@ export function ja4(ch: ClientHello, transport: "t" | "q" = "t"): string {
   const exts = ch.extensions.filter((e) => !isGrease(e));
 
   const sni = ch.sni ? "d" : "i";
-  const alpn0 = ch.alpn[0] ?? "";
-  const alpnCode = alpn0 ? alpn0[0] + alpn0[alpn0.length - 1] : "00";
+  const alpnBytes = ch.alpnRaw?.[0]?.length
+    ? ch.alpnRaw[0]
+    : ch.alpn[0] ? [...Buffer.from(ch.alpn[0], "utf8")] : [];
+  const isAlnum = (b: number) => (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x5a) || (b >= 0x61 && b <= 0x7a);
+  let alpnCode = "00";
+  if (alpnBytes.length) {
+    const first = alpnBytes[0], last = alpnBytes[alpnBytes.length - 1];
+    if (isAlnum(first) && isAlnum(last)) alpnCode = String.fromCharCode(first) + String.fromCharCode(last);
+    else {
+      const hex = alpnBytes.map(hex2).join("");
+      alpnCode = hex[0] + hex[hex.length - 1];
+    }
+  }
   const a = `${transport}${verStr(ch)}${sni}${cap99(ciphers.length)}${cap99(exts.length)}${alpnCode}`;
 
-  const b = sha12(ciphers.map(hex4).sort().join(","));
+  const cipherText = ciphers.map(hex4).sort().join(",");
+  const b = cipherText ? sha12(cipherText) : "000000000000";
 
   // ja4_c: extensions sorted, but SNI (0000) and ALPN (0010) removed from the
   // sorted list; signature algorithms appended in their original order.
   const extForC = exts.filter((e) => e !== 0x0000 && e !== 0x0010).map(hex4).sort();
-  const sig = ch.sigAlgs.map(hex4).join(",");
-  const c = sha12(`${extForC.join(",")}_${sig}`);
+  const sig = ch.sigAlgs.filter((s) => !isGrease(s)).map(hex4).join(",");
+  const extText = extForC.join(",");
+  const c = extText ? sha12(sig ? `${extText}_${sig}` : extText) : "000000000000";
 
   return `${a}_${b}_${c}`;
 }
@@ -205,7 +263,7 @@ export function ja3String(ch: ClientHello): string {
 }
 /** JA3 MD5 of the canonical string above. */
 export function ja3(ch: ClientHello): string {
-  return createHash("md5").update(ja3String(ch)).digest("hex");
+  return md5hex(ja3String(ch));
 }
 
 export function fingerprintFromClientHello(buf: Buffer):

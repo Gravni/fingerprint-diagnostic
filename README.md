@@ -1,73 +1,112 @@
 # Browser Fingerprint Diagnostic (core)
 
-A diagnostic that captures a browser's fingerprint across many execution realms and
-the network layer, then compares two browser profiles to judge how consistently
-they present themselves. Useful for research into fingerprint surface, browser
-privacy testing, and anti-fingerprinting QA.
+This repository contains the reviewable, framework-independent core of a browser
+fingerprint diagnostic. It collects typed browser measurements across execution
+contexts, observes selected network-layer properties, and compares two captures.
+Its intended uses are browser privacy research and anti-fingerprinting QA.
 
-## What it measures
+## Repository boundary
 
-- **Browser realms:** main frame, dedicated/shared/module workers, audio worklet,
-  same-origin / sandboxed / credentialless iframes, real-URL iframe, service worker,
-  and a true cross-site OOPIF (separate renderer process).
-- **Network layer:** a small TLS-terminating capture server reads the raw
-  ClientHello and computes **JA4 / JA3 / JA3S**, ALPN, extensions, curves, and the
-  HTTP request-header order. (One item is still open — see Status.)
-- **Controls:** four vendored open-source fingerprinting engines run alongside the
-  built-in probe for cross-checking — **ThumbmarkJS**, **FingerprintJS (OSS)**,
-  **FPScanner + fp-collect**, and **ClientJS**. See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+Included here:
 
-Every value is captured through a single typed measurement envelope
-(`{path, context, phase, status, valueType, value, error, meta}`) with a lossless,
-recursive encoder (stable hashing, cycle-safe, blob-refs for oversized values).
+- the browser probe template and four self-hosted control-engine artifacts;
+- typed-value encoding, schema checks, readiness checks, comparison rules, and
+  JA3/JA4 parsing;
+- an HTTP/TLS capture server plus HTTP/2 SETTINGS/pseudo-header observation code;
+- unit and loopback integration tests plus diagnostic fixtures;
+- a GitHub Actions workflow that runs the same verification on macOS and Linux.
 
-## Status — v4.3
+Not included here:
 
-**11 of 12** internal review items are closed. The one remaining open item is:
+- the production panel, API routes, database writer, authentication, admin UI,
+  Excel/Markdown exporters, deployment configuration, or a `side-status` route;
+- Playwright/browser-smoke code or smoke artifacts;
+- production capture results, secrets, certificates, or server logs.
 
-> **#8 Network — H2 SETTINGS frame + pseudo-header order.** Everything else in the
-> network layer is done (real JA3 with curves/point-formats, JA4 against the official
-> vector + fuzz, multi-record ClientHello reassembly, versioned typed `net-v5`
-> schema, two-phase Accept-CH). The residual needs a **raw HTTP/2 frame + HPACK
-> parser** (the endpoint currently negotiates HTTP/1.1 and records H2 fields as a
-> structured "not captured" status).
+Consequently, this repository alone cannot prove that the deployed application is
+READY, that the server persisted every context, or that a real plain/anti pair
+passes validation. The application integration requirements are listed in
+[`docs/SERVER-INTEGRATION-HANDOFF.md`](docs/SERVER-INTEGRATION-HANDOFF.md).
 
-Details and the full item-by-item tracker: [`docs/FINGERPRINT-V4-PLAN.md`](docs/FINGERPRINT-V4-PLAN.md)
-and [`docs/FINGERPRINT-CODEX-HANDOFF.md`](docs/FINGERPRINT-CODEX-HANDOFF.md).
+## Source capabilities
+
+- **Browser contexts:** the probe contains collectors for the main frame,
+  dedicated/shared/module workers, audio worklet, iframe variants, service worker,
+  a cross-origin iframe, permissioned probes, and a terminal run manifest. Which
+  contexts actually run depends on the missing host application and deployment.
+- **Network:** `scripts/capture-server.mjs` parses TLS ClientHello data for JA3/JA4
+  inputs and contains source support for HTTP/2 SETTINGS and received pseudo-header
+  order. This is not a claim that a production endpoint has been redeployed or
+  observed in a live paired run.
+- **Controls:** ThumbmarkJS, FingerprintJS OSS, FPScanner + fp-collect, and ClientJS
+  artifacts are stored locally. They are independent observations, not inputs to a
+  good/bad verdict. See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+- **Typed records:** measurements use
+  `{path, context, phase, status, valueType, value, error, meta}`. The encoder is
+  bounded and JSON-safe; any claim of fully lossless out-of-band blob persistence
+  also depends on server code that is not in this repository.
+- **Readiness:** `lib/fp-readiness.mjs` provides strict side and pair validation for
+  an integrating server. Merely receiving the first JSONL record is never
+  completion.
 
 ## Layout
 
-```
-lib/         pure core — ja4.ts, fp-encode.mjs, fp-schema.mjs, fp-expect.mjs,
-             fp-vectors.ts, fp-compare.mjs  (dependency-free, standalone-typecheckable)
-assets/      fingerprint-probe.html + assets/vendor/* (the four control engines)
-scripts/     capture-server.mjs (JA4/TLS) + the unit test suite + fp-test.sh
-docs/        module doc, v4 plan, JA4 setup notes, review handoff
-tests/       fixtures used by the schema regression tests
+```text
+assets/      browser probe and vendored control-engine artifacts
+lib/         encoding, schema, readiness, comparison, protocol parsers
+scripts/     capture server and executable test files
+tests/       diagnostic and legacy fixtures
+docs/        technical scope, current plan, and integration handoff
 ```
 
-## Build & test
+## Verify the checked-out source
+
+Use Node.js 22.14 or newer, matching the committed engine requirement and the
+runtime used by the HTTP/2 integration tests.
 
 ```bash
-# unit suite (Node ≥ 20, no install needed) — 207 assertions
 bash scripts/fp-test.sh
-
-# typecheck the standalone core
-npm install && npm run typecheck
-
-# JA3/JA4 vectors specifically
-node --experimental-strip-types scripts/fp-ja4.test.mts
 ```
 
-## Notes
+The suite prints its own current assertion totals. Documentation intentionally
+does not hard-code a count because it changes when regressions are added.
 
-- All hostnames/IPs in code and docs are **placeholders** (`*.example`,
-  `203.0.113.x`). Point them at your own hosts to run the network layer.
-- `lib/` is decoupled and has no framework or database dependency. The web glue
-  that wires the probe into an app is intentionally **not** included here.
+Install the two locked development dependencies without install scripts, then
+run the complete verification command:
+
+```bash
+npm ci --ignore-scripts
+npm run verify
+```
+
+`package-lock.json` pins the development dependency graph. TypeScript checks the
+`.ts` sources and `.d.mts` public declarations. Runtime `.mjs` modules are
+executed directly by the regression suite; this is not misrepresented as
+`checkJs` coverage, and the absent production application is not typechecked.
+
+The capture process computes its `captureBuild` at startup from the closed
+`lib/` + `scripts/` executable inventory and refuses a mismatched configured ID.
+That identifies this core checkout only; the absent panel, routes, UI, exporter,
+and deployment still require their own component IDs. Each `net-v6` record also
+stores `captureRuntime` (`node`, `v8`, `openssl`, `nghttp2`) because identical
+source bytes running on different protocol stacks are not the same deployment
+evidence. This is source/runtime attribution, not a claim that moving CI images
+are bit-for-bit reproducible.
+
+Some loopback network tests may require permission to bind a local port.
+
+## Review status
+
+Treat the current branch as source under review, not as an accepted release.
+Before any employee collection, all local checks must pass, the missing server
+integration must be reviewed and deployed, and one fresh plain/anti paired run
+must pass the same server-side validator. See
+[`docs/FINGERPRINT-V4-PLAN.md`](docs/FINGERPRINT-V4-PLAN.md).
 
 ## License
 
-The diagnostic code in this repository is MIT-licensed (see [`LICENSE`](LICENSE)).
-The vendored engines under `assets/vendor/` keep their own upstream licenses
-(MIT / Apache-2.0) — see [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+Repository-authored code is offered under [`LICENSE`](LICENSE). Files under
+`assets/vendor/` retain their third-party terms. Local license evidence,
+artifact hashes, and known provenance gaps are recorded in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) and
+[`assets/vendor/vendor-lock.json`](assets/vendor/vendor-lock.json).

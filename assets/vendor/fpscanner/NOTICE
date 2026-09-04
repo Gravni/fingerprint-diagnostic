@@ -1,0 +1,25 @@
+FPScanner control-engine bundle
+===============================
+
+Local artifact: fpscanner.bundle.js
+
+This local bundle was assembled from these exact published npm inputs:
+
+- fpscanner 0.1.5, source file `src/fpScanner.js`
+  npm integrity: sha512-DNHW1xDndAj1WEfmaXwSnT/CRYenoB5unfJyYY+aFBGPjXb5zdbWPLUeMnskci0naZBxIcG7aF/LMl4sFVwi9Q==
+  npm gitHead: cf1d0c1cbe53bba244c14862cb8c30ec92176fb3
+  license: MIT; see `LICENSE`
+- fpcollect 1.0.5, source file `src/fpCollect.js`
+  npm integrity: sha512-IZBlcncoRT+NDIGGYIA9TQtvnNA2cKhu/6Q5BhyY+13QskgI5u7URDiHFUjNjeumJbbhpf8/q8YlbhbJ6cN+bA==
+  npm gitHead: 7a49625651a61c1b8b9a6114b841fe74c7ec3b31
+  license: MIT; see `fpcollect-LICENSE`
+- ua-parser-js 0.7.40, source file `src/ua-parser.js`
+  npm integrity: sha512-us1E3K+3jJppDBa3Tl0L3MOJiGhe1C6P0+nIvQAFYbxlMAx0h81eOwLmU57xgqToduDDPx3y5QsdjPfDu+FgOQ==
+  npm gitHead: 5c811b80060f9c568662102cf3b9fee2aaf56545
+  license: MIT; see `ua-parser-js-LICENSE.md`
+
+The three source files stored in `src/` were verified byte-for-byte against
+those npm tarballs on 2026-09-04. Their local hashes and the bundle hash are in
+`../vendor-lock.json`. The exact temporary build workspace, entry file and
+esbuild package/lock used to produce the current bundle are not retained, so
+this notice does not claim a byte-for-byte reproducible rebuild.

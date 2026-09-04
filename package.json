@@ -1,15 +1,21 @@
 {
   "name": "fingerprint-diagnostic",
-  "version": "4.3.0",
-  "description": "Browser-fingerprint diagnostic core — cross-realm capture + network JA4/JA3, with open-source engine controls.",
+  "version": "4.4.0",
+  "description": "Browser-fingerprint diagnostic core with strict paired readiness and observed TLS/HTTP2 metadata.",
   "type": "module",
+  "private": true,
   "license": "MIT",
+  "engines": {
+    "node": ">=22.14.0"
+  },
+  "packageManager": "npm@10.9.2",
   "scripts": {
     "test": "bash scripts/fp-test.sh",
-    "typecheck": "tsc -p tsconfig.json"
+    "typecheck": "tsc -p tsconfig.json",
+    "verify": "npm run typecheck && npm test"
   },
   "devDependencies": {
-    "typescript": "^5.6.0",
-    "@types/node": "^22.0.0"
+    "@types/node": "22.20.1",
+    "typescript": "5.9.3"
   }
 }

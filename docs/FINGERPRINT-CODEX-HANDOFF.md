@@ -1,53 +1,98 @@
-# Fingerprint module v4.3 — handoff for Codex re-review
+# Fingerprint diagnostic — source-review handoff
 
-Everything needed to re-review v4.3. Panel test-result exports are delivered
-separately by the operator. Full per-item detail + exact pins are in
-`docs/FINGERPRINT-V4-PLAN.md` (v4.3 section). **v4.3 is NOT fully done: #8 remains
-partial (H2).** No live paired run has been done — code re-acceptance first.
+This document describes the contents and review boundary of the current Git
+checkout. It deliberately does not repeat an old bundle version, fixed assertion
+count, or a historical “items closed” score.
 
-## 0. TL;DR
-- All 12 v4.3 P0s addressed: **11 fully done, #8 partial** (H2 SETTINGS +
-  pseudo-header order is the sole residual — needs raw HTTP/2 frame + HPACK
-  parsing; the endpoint negotiates http/1.1 and records that as a structured
-  status). Nothing else deferred.
-- Unit suite: `bash scripts/fp-test.sh` → **207 assertions across encode / schema /
-  compare / vendor / ja4, exit 0**.
-- Runtime smoke (`scripts/fp-smoke.mjs`, Playwright, `--site-per-process`) → **PASS**:
-  14 contexts, 4/4 real engines, **server-confirmed side COMPLETE**, zero
-  duplicate {context,path}, all-2xx responses, **cross-site OOPIF is a separate
-  renderer target**, and **no third-party egress in the quiet window**. Artifacts:
-  `smoke-artifacts/` (screenshot, report, request ledger).
-- Bundle build gates are real (Codex #10): FULL repo typecheck + tests + standalone
-  typecheck + standalone tests all gate the build (no `|| swallow`); a missing
-  source file aborts the rootBuildId.
+## Review-branch changes Claude must preserve
 
-## 1. The 12 v4.3 items
-| # | Item | State |
+- The browser template is rendered from one exact collector source; the source
+  SHA-256 is part of every persisted identity and both sides of a pair.
+- Same-origin real-URL iframe, cross-site iframe and Service Worker handshakes
+  bind build, exact collector artifact, capture and fresh request/challenge data.
+- Readiness owns a fixed 14-context matrix and build-owned leaf contracts. A
+  browser manifest, control manifest or caller-provided matrix cannot lower it.
+- AudioWorklet, Canvas, WebGL1/2, WebGPU, WebRTC, permissioned media/geo/device
+  branches and the 21 FPScanner tests are independently reconciled server-side.
+- Thumbmark/FingerprintJS derived IDs, the exact ClientJS getter set and all
+  local sanity rows are mandatory; self-reported component counts are not enough.
+- UA Client Hints use `formFactors` (plural) and the network round includes
+  `Sec-CH-UA-Form-Factors` together with the previously required high-entropy
+  hints.
+- The capture service's source build is a closed-tree SHA-256 and a current
+  network record also carries the observed peer address, runtime versions, raw
+  ClientHello-derived vectors, H2 SETTINGS and pseudo-header order.
+
+The private application must consume these contracts as written. Converting a
+legacy row into v4.4 by filling missing identities or manifests with current
+values would fabricate evidence and is forbidden.
+
+## What can be reviewed here
+
+- browser probe template: `assets/fingerprint-probe.html`;
+- typed encoder, schema classifier, readiness validator, expectation registry,
+  and comparator under `lib/`;
+- TLS ClientHello/JA3/JA4 code and HTTP/2 observation code;
+- standalone capture server;
+- vendored control-engine artifacts, local hashes, and license material;
+- executable unit/loopback tests and fixtures.
+
+Run the tests from the repository root:
+
+```bash
+bash scripts/fp-test.sh
+```
+
+Use the totals printed by that exact run. No test result or build artifact is
+committed here as evidence, and this document does not claim that an earlier log
+still describes the checkout.
+
+## What cannot be accepted from this repository alone
+
+The production web application is absent. In particular, this repository does
+not contain the panel routes, durable JSONL/database writer, `side-status`
+endpoint, session-completion/UI logic, exporters, deployment configuration, or
+browser-smoke harness. It therefore cannot establish any of the following:
+
+- server-side integration of `validateSideCapture` / `validatePairedCapture`;
+- durable acknowledgement of every browser context and the network record;
+- consistency between raw JSONL, Markdown, Excel, and the admin UI;
+- a real cross-site OOPIF process observation in the deployed environment;
+- zero third-party egress at runtime;
+- a production build ID covering the collector, capture server, panel writer,
+  routes, UI, and exporter;
+- a fresh plain/anti pair marked READY by the deployed validator.
+
+Those are pending integration/evidence tasks, not implied by passing core unit
+tests. The exact server checklist is in
+[`SERVER-INTEGRATION-HANDOFF.md`](SERVER-INTEGRATION-HANDOFF.md).
+
+## Current facts and review risks
+
+| Area | Present in this checkout | Still required before use |
 |---|---|---|
-| 1 | Completion/lifecycle — «готово» only after server-confirmed side-status | done (finalised with #2) |
-| 2 | Validator — server canonical matrix; expected=[] fails; unreadable JSONL ⇒ NOT_READY; enumerated allowed non-ok per path/context | done |
-| 3 | Lossless encoder — recursive nested values, cycles, sync SHA-256, blobRef; no `slice(0,400)` | done |
-| 4 | FPScanner mapping 1=INCONSISTENT/2=UNSURE/3=CONSISTENT + raw consistent/data | done |
-| 5 | Control engines — per-engine typed manifest; controlStatus graded on version/ok/count/errors; Thumbmark one run | done |
-| 6 | Comparator — one production impl; registry from ACTUAL emitted paths; mode-aware; contract test (every emitted path target-or-excluded) | done |
-| 7 | Smoke/E2E — persistence + responses + employeeReady(side) + dups + build IDs + request ledger + quiet no-egress | done |
-| 8 | Network | **PARTIAL** — done: real JA3 (ext 10/11), JA4 official vector + fuzz, fired≠ack (capture awaits panel save), MULTI-RECORD ClientHello reassembly, VERSIONED TYPED net-v5 schema, TWO-PHASE Accept-CH (round index). **Residual: H2 SETTINGS + pseudo-header order (raw HTTP/2 + HPACK).** |
-| 9 | OOPIF — 2nd registrable domain (capture-crosssite.example), event.origin verified + parent/child origins recorded, CDP separate-renderer-target evidence, same-site dropped from PASS, collector cache keyed by build hash | done |
-| 10 | Provenance — rootBuildId over the WHOLE executable tree (missing file aborts); per-component builds (browser/cross-origin/capture/panel/vendor-lock) in raw + validation.json + builds.json; build script gates don't swallow FAIL | done |
-| 11 | Deps/licences — ClientJS REBUILT with ua-parser 0.7.41 (0.7.30/GHSA gone); vendor-lock.json; fp-collect/ua-parser/JA4 notices | done |
-| 12 | Export — real `raw union = classified + excluded(reason)` equation (balances on real data); one READY/NOT-READY; «Проблемы» sheet | done |
+| Typed browser data | Probe and core encoder/schema code | Verify actual deployed probe is generated from the reviewed source |
+| Readiness | Strict framework-independent validator | Wire it into the server and make its result authoritative for API/UI/export |
+| Comparator | Facts-first rules and duplicate handling | Wire the same implementation into production and reconcile against raw |
+| Network | ClientHello parsing and HTTP/2 observer/capture source | Pass tests, deploy the exact source, and observe a real `net-v6` round-2 record |
+| Controls | Four local artifacts and static integrity/config tests | Runtime no-egress and successful engine manifests in the paired smoke |
+| OOPIF | Probe/capture hooks | Cross-site origin and browser-process evidence in the deployed smoke |
+| Provenance | Lockfile plus fail-closed capture ID over declared `lib/` + `scripts/` | Separate panel/route/UI/export IDs and a final product-level root identity |
+| Licenses | Root license and several vendor license files/notices | Resolve the provenance/license-copy gaps listed in `THIRD_PARTY_NOTICES.md` |
+| Export | Core comparator only | Production raw-union reconciliation and human-view checks; exporter source is absent |
 
-## 2. Verify
-1. `sha256sum -c SHA256SUMS.txt`
-2. `npm install && npm run typecheck && npm test` (see `test-ci-log.txt` — full repo typecheck + tests + standalone all gated).
-3. Runtime: `node scripts/fp-smoke.mjs` against the live panel → PASS (needs server + capture host up). See `smoke-artifacts/`.
-4. JA3/JA4 vectors: `node --experimental-strip-types scripts/fp-ja4.test.mts` (official salesforce JA3 + FoxIO JA4 + multi-record + fuzz).
+## Acceptance order
 
-## 3. The one residual (keeps #8 partial)
-**#8 H2 SETTINGS + pseudo-header order.** node's http2 abstracts frame order away;
-capturing it needs a raw HTTP/2 frame + HPACK parser (mirroring the JA4 ClientHello
-peek). The endpoint negotiates http/1.1 today and records H2 fields as a structured
-"not-captured (needs raw h2 frame parse)" status. Not claimed done.
+1. Review the current Git diff and run all local tests.
+2. Integrate the accepted core into the production server using the server
+   handoff checklist.
+3. Build and deploy from a clean, identified source revision.
+4. Run an automated browser smoke for both `plain` and `anti`, checking responses,
+   persistence, expected contexts, manifests, duplicate keys, network, controls,
+   OOPIF evidence, and runtime egress.
+5. Only after code acceptance, perform one fresh human paired plain/anti capture.
+6. Mark the collector ready for employees only if the same server-side pair
+   validator says READY and all raw/derived views reconcile.
 
-## 4. NOT in this bundle
-node_modules, .next, Chromium, SQLite DB, secrets, panel test-result exports.
+Historical exported fixtures are regression inputs only. They are not evidence
+that the current source or deployment satisfies these gates.

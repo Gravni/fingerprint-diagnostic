@@ -5,11 +5,10 @@ import { createHash } from "node:crypto";
 
 let pass = 0, fail = 0;
 const ok = (label: string, cond: boolean) => { if (cond) pass++; else { fail++; console.log("  ✗ " + label); } };
-const md5 = (s: string) => createHash("md5").update(s).digest("hex");
 
 const CH = (o: Partial<ClientHello>): ClientHello => Object.assign({
   tlsRecordVersion: 0x0301, handshakeVersion: 0x0301, supportedVersionMax: null,
-  ciphers: [], extensions: [], sni: null, alpn: [], sigAlgs: [], curves: [], pointFormats: [],
+  ciphers: [], extensions: [], sni: null, alpn: [], alpnRaw: [], sigAlgs: [], curves: [], pointFormats: [],
 }, o);
 
 // ---- JA3: canonical salesforce vector -------------------------------------
@@ -24,7 +23,6 @@ const CH = (o: Partial<ClientHello>): ClientHello => Object.assign({
   const want = "769,47-53-5-10-49161-49162-49171-49172-50-56-19-4,0-10-11,23-24-25,0";
   ok("JA3 string = salesforce vector (5 fields populated)", ja3String(ch) === want);
   ok("JA3 md5 = ada70206e40642a3e4461f35503241d5", ja3(ch) === "ada70206e40642a3e4461f35503241d5");
-  ok("JA3 md5 == md5(string)", ja3(ch) === md5(want));
 }
 // curves/point-formats field must NOT be empty when present (the old bug)
 ok("JA3 no longer emits empty curve/pf fields", !/,,$/.test(ja3String(CH({ handshakeVersion: 769, ciphers: [1], extensions: [0], curves: [23], pointFormats: [0] }))));
@@ -43,6 +41,36 @@ ok("JA3 no longer emits empty curve/pf fields", !/,,$/.test(ja3String(CH({ hands
 }
 ok("JA4 SNI absent → 'i'", ja4(CH({ handshakeVersion: 0x0303, supportedVersionMax: 0x0304, ciphers: [0x1301], extensions: [0x002b], alpn: ["h2"] })).indexOf("t13i") === 0);
 ok("JA4 no ALPN → '00'", /h2_|00_/.test(ja4(CH({ handshakeVersion: 0x0303, supportedVersionMax: 0x0304, ciphers: [0x1301], extensions: [0x002b] }))) && ja4(CH({ handshakeVersion: 0x0303, supportedVersionMax: 0x0304, ciphers: [0x1301], extensions: [0x002b] })).slice(8, 10) === "00");
+
+// ---- JA4 edge cases from the official FoxIO technical details ------------
+{
+  const empty = ja4(CH({ tlsRecordVersion: 0x0303, handshakeVersion: 0x0303, supportedVersionMax: 0x0304 }));
+  ok("JA4 empty cipher/extension lists use twelve zeroes", empty === "t13i000000_000000000000_000000000000");
+}
+{
+  const ch = CH({ tlsRecordVersion: 0x0303, handshakeVersion: 0x0303, supportedVersionMax: 0x0304,
+    ciphers: [0x1301], extensions: [0x002b], sigAlgs: [] });
+  const extOnly = createHash("sha256").update("002b").digest("hex").slice(0, 12);
+  ok("JA4 extension hash has no trailing underscore without sig-algs", ja4(ch).split("_")[2] === extOnly);
+}
+{
+  const base = CH({ tlsRecordVersion: 0x0303, handshakeVersion: 0x0303, supportedVersionMax: 0x0304,
+    ciphers: [0x1301], extensions: [0x002b, 0x000d], sigAlgs: [0x0403, 0x0804] });
+  const greased = CH({ ...base, sigAlgs: [0x0a0a, 0x0403, 0x1a1a, 0x0804] });
+  ok("JA4 ignores GREASE inside signature algorithms", ja4(base) === ja4(greased));
+}
+{
+  const code = (bytes: number[]) => ja4(CH({ tlsRecordVersion: 0x0303, handshakeVersion: 0x0303,
+    supportedVersionMax: 0x0304, alpnRaw: [bytes], alpn: [Buffer.from(bytes).toString("latin1")] })).split("_")[0].slice(-2);
+  const vectors: Array<[number[], string]> = [
+    [[0xab], "ab"], [[0x20], "20"], [[0xab, 0xcd], "ad"], [[0x20, 0x61], "21"],
+    [[0x30, 0xab], "3b"], [[0x61, 0x20], "60"], [[0x30, 0x31, 0xab, 0xcd], "3d"],
+    [[0x30, 0xab, 0xcd, 0x31], "01"], [[0x78], "xx"],
+  ];
+  ok("JA4 ALPN hex fallback matches every official example", vectors.every(([bytes, want]) => code(bytes) === want));
+}
+ok("JA4 version fallback uses TLS record protocol version, not ClientHello legacy version",
+  ja4(CH({ tlsRecordVersion: 0x0303, handshakeVersion: 0x0301, ciphers: [0x1301] })).startsWith("t12"));
 
 // ---- parser round-trip (build a real ClientHello, parse it) ---------------
 function u16(n: number) { return [(n >> 8) & 0xff, n & 0xff]; }
@@ -93,6 +121,12 @@ ok("record-type wrong → null", parseClientHello(Buffer.from([0x17, 3, 3, 0, 5,
   let threw = false;
   for (let n = 0; n <= full.length; n++) { try { parseClientHello(full.subarray(0, n)); } catch { threw = true; break; } }
   ok("truncation at EVERY length never throws", !threw);
+  ok("every proper ClientHello prefix is rejected as incomplete",
+    Array.from({ length: full.length }, (_, n) => n).every((n) => parseClientHello(full.subarray(0, n)) === null));
+  const badRecordLength = Buffer.from(full);
+  badRecordLength.writeUInt16BE(full.readUInt16BE(3) + 1, 3);
+  ok("declared TLS record length larger than bytes is incomplete", !clientHelloComplete(badRecordLength));
+  ok("declared TLS record length larger than bytes is not parsed", parseClientHello(badRecordLength) === null);
 }
 {
   // overrun: claim a huge cipher length

@@ -1,65 +1,91 @@
-# Fingerprint module (v4) — canonical technical description
+# Fingerprint diagnostic core — technical contract
 
-Measures an employee's browser fingerprint in their ordinary browser (`plain`)
-and their anti-detect browser (`anti`), per collection SESSION, and compares the
-pair to show what the anti-detect actually replaced vs. what leaked. Version
-history is in `CHANGELOG.md`; the phase tracker + Definition of Done in
-`docs/FINGERPRINT-V4-PLAN.md`. Term everywhere: **subject** (never «subject»).
+The product flow compares a capture from ordinary Chrome (`plain`) with one from
+the browser under test (`anti`). This public repository supplies the collector
+core and validation primitives; the production panel, persistence, UI, and
+exporters are separate and must implement the integration contract in
+[`SERVER-INTEGRATION-HANDOFF.md`](SERVER-INTEGRATION-HANDOFF.md).
 
-## Data model — typed at collection (the v4 keystone)
-The probe (`assets/fingerprint-probe.html`) produces a **typed measurement
-envelope in the browser**, at collection time — never reconstructed on the server:
+## Typed measurement envelope
 
-```
+Browser measurements use this collection-time shape:
+
+```text
 { path, context, phase, status, valueType, value, error, meta }
 ```
 
-- `status` ∈ closed enum: `ok · unsupported · unavailable-in-context ·
-  permission-required · permission-denied · blocked · timeout · error · invalid-result`.
-- `valueType` ∈ `null·undefined·boolean·string·number·bigint·symbol·function·
-  array·object·arraybuffer·typedarray·error`. Native types are preserved: `false`
-  is a boolean, arrays stay arrays (`meta.count===length`), NaN/Infinity/-0/bigint
-  are explicit (`meta.special`), a thrown probe goes to `error` (never into `value`).
-- `M()`/`MA()` wrap every probe (typed record + a legacy string for back-compat);
-  `MSTATUS.*` lets a probe declare an explicit non-ok status instead of a fake value.
-- The typed records ride in each context payload as `_measurements`;
-  `lib/fp-schema.mjs` classifies a session CURRENT / MIXED / LEGACY_LOSSY / INVALID.
+The schema distinguishes successful values from unsupported, unavailable,
+permission-related, blocked, timeout, error, and invalid results. Native special
+values and structured objects are encoded into JSON-safe tagged forms. The
+encoder is bounded; oversized/deep data needs a real server-side blob store before
+it may be described as end-to-end lossless.
 
-## Realms (browser) + network + control engines — kept separate
-- **browser realms**: main-frame · same-origin srcdoc iframe · real-URL same-origin
-  frame (`/fingerprint/frame`) · sandboxed iframe · credentialless iframe ·
-  dedicated & shared workers (classic + module) · service-worker · cross-site OOPIF
-  (`/xprobe` on the JA4 host) · audio-worklet (with a DSP result). Each records its
-  isolation metadata; missing realms are explicit `blocked`/`unsupported`, never silent.
-- **network** (`scripts/capture-server.mjs`, `capture-samesite.example:8443`): JA4/JA3,
-  TLS/ALPN/cipher/ext, HTTP version, header names+order, Client Hints, Fetch Metadata,
-  provenance. TLS terminates on our capture endpoint.
-- **control engines** (independent, self-hosted, telemetry OFF, pinned + SHA): ThumbmarkJS,
-  FingerprintJS OSS v5 (MIT), plus original `control.fpscanner.*` and `control.consistency.*`
-  adapters. Raw components only — they never feed our verdicts.
+The schema/readiness code validates the encoded structure recursively. A server
+must not reconstruct types later from display strings.
 
-## Validation — separate statuses (never one VALID flag)
-`validateSessionV4` (in `validation.json` / `?validationV4=1`): `integrityStatus ·
-schemaStatus · coverageStatus · permissionedStatus · networkStatus · controlStatus ·
-employeeReady`. An incomplete snapshot may be exported for debug but is never
-`employeeReady`. The legacy `20260901` session → schema `LEGACY_LOSSY`,
-`overall=LEGACY_INCOMPLETE` (kept only as `tests/fixtures/legacy-incomplete-20260901`).
+## Contexts and terminal state
 
-## Comparator — facts before verdicts
-`compare()` runs on the typed records: compares only when BOTH sides are `ok`; a
-side that isn't `ok` is `unresolved` (coverage), NEVER leaked/masked. A difference is
-`masked` only when the anti-profile marks that path protected, else `different`;
-identical-but-protected is `leaked`. No leaked/masked verdicts without a profile;
-volatile paths separate; confounders (hardware/build/locale/screen) shown first;
-plain and anti status+type shown apart. Markdown/Excel are derived views and must
-reconcile arithmetically (Σ verdicts == rows).
+The probe contains collectors for main frame, iframe variants, dedicated/shared/
+module workers, service worker, audio worklet, cross-origin iframe, permissioned
+probes, and network. A terminal `run-manifest` reports each expected context.
 
-## Tests
-`bash scripts/fp-test.sh` — typed encoder, schema/schemaStatus, comparator rules,
-vendored-engine SHA pins + telemetry-off, legacy fixture. Run before any change.
+The server owns the canonical expected matrix. A browser-reported expectation
+list cannot remove required contexts. Required contexts count as complete only at
+terminal status `finished`; `fired` or request presence is not completion.
 
-## Before employees (terminal human step)
-Fix + code-review + CI green, THEN ONE fresh paired plain+anti run in Chromium (same
-collector, same machine, passive + permissioned, internal repeats), validated by
-`validateSessionV4` → only then hand the collector to subjectи. The legacy raw is a
-regression fixture, never proof of v4 features.
+## Network
+
+The capture source parses TLS ClientHello material used by JA3/JA4 and records
+ordered HTTP fields. The current source target is `net-v6`, including HTTP/2
+SETTINGS wire order/effective values and received pseudo-header order. Round 1
+primes `Accept-CH`; only round 2 is the measurement and must be durably
+acknowledged before the browser marks network `finished`.
+
+Older fixture records are legacy data. Source support is not proof that the
+production capture endpoint was redeployed or that a live browser produced a
+valid `net-v6` record.
+
+## Control engines
+
+Four local artifacts may run as independent control measurements: ThumbmarkJS,
+FingerprintJS OSS, FPScanner + fp-collect, and ClientJS. Their component values
+are observations, not a safe/unsafe oracle. READY does, however, require every
+configured engine to produce an internally consistent manifest bound to its exact
+typed component rows. Static integrity/config tests do not prove runtime
+no-egress; that requires a browser request ledger. See
+[`../THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md).
+
+## Readiness
+
+`lib/fp-readiness.mjs` exposes strict side and pair validation. An integrating
+server must provide persisted records plus its non-empty canonical expected
+matrix. Readiness is blocked by malformed/unreadable records, missing contexts,
+duplicate `(context,path)` keys, unexpected non-OK results, an incomplete
+permissioned manifest, an incomplete network record, or missing control
+manifests.
+
+One authoritative result must feed the API, UI, Markdown, and Excel. An incomplete
+snapshot may be exported for debugging but cannot be labeled READY.
+
+## Comparator
+
+The comparator is facts-first: it compares statuses/types/values, handles
+duplicates explicitly, and applies a profile expectation only through the
+registry. It must not label an unavailable measurement as leaked or masked, and
+it must not silently keep the last duplicate value.
+
+Derived output must prove:
+
+```text
+raw records = classified rows + excluded rows with explicit reasons
+```
+
+The exporter implementation is not in this repository, so that equation remains
+an application-integration gate.
+
+## Acceptance sequence
+
+Review current source and run its tests, review/deploy the missing server
+integration, run an automated paired browser smoke, then make one fresh human
+plain/anti capture. Historical fixtures remain regression inputs, not proof of
+current runtime behavior.
