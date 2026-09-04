@@ -1,0 +1,15 @@
+{
+  "_context": "main-frame",
+  "navigator.appCodeName": "Mozilla",
+  "navigator.appName": "Netscape",
+  "navigator.appVersion": "5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+  "navigator.bluetooth._fns": "addEventListener,dispatchEvent,getAvailability,removeEventListener,requestDevice,when",
+  "navigator.clipboard.onclipboardchange": "null",
+  "navigator.clipboard._fns": "addEventListener,dispatchEvent,read,readText,removeEventListener,when,write,writeText",
+  "navigator.connection.downlink": "9",
+  "navigator.connection.effectiveType": "4g",
+  "navigator.connection.onchange": "null",
+  "navigator.connection.rtt": "150",
+  "navigator.connection.saveData": "false",
+  "__note": "trimmed legacy payload (flat string map, no _measurements) — fixture for schemaStatus=LEGACY_LOSSY"
+}

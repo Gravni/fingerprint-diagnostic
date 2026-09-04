@@ -1,0 +1,27 @@
+{
+  "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+  "proxy": "on",
+  "vectors": {
+    "canvas": "direct",
+    "webgl": "noise",
+    "clientRects": "direct",
+    "audio": "direct",
+    "webgpu": "fake",
+    "mediaDevices": "fake",
+    "fonts": "real",
+    "timezone": "auto",
+    "geolocation": "auto"
+  },
+  "hw": {
+    "os": "macOS 15 (Sequoia)",
+    "resolution": "1728×1117",
+    "cores": "8",
+    "memory": "8"
+  },
+  "savedAt": "2026-09-03T16:13:41.007Z",
+  "by": {
+    "id": "00000000-0000-0000-0000-000000000000",
+    "login": "subject@example.com",
+    "name": null
+  }
+}

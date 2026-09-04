@@ -1,0 +1,25 @@
+{
+  "sessionId": "20260903-160918",
+  "readiness": "NOT_EMPLOYEE_READY",
+  "role": "diagnostic-regression-fixture",
+  "purpose": "First full paired plain+anti run after the v4.1 realm-timeout fix. Kept ONLY as a regression fixture to prove the realm fix and to reproduce the v4.2 blockers below. This session must NEVER be treated as employee-ready or as proof of v4 completeness.",
+  "verified_positive": [
+    "archive intact, all SHA match",
+    "both sides collected 13 browser/permissioned contexts",
+    "7066 typed records per side",
+    "881 unique typed paths per side",
+    "every browser context classifies CURRENT individually",
+    "no realm timeout / post-failed in this run",
+    "canvas/webgl and the main realm matrix work"
+  ],
+  "known_blockers_v4_2": [
+    "false readiness: presence of a first plain+anti line was mistaken for COMPLETE; no terminal per-realm manifest",
+    "permissioned manifest untrustworthy: prompt counted as granted; no getUserMedia; geo stored only as coarse bucket",
+    "network raw partial and h1.1-only (P6 not fully implemented) and was not packaged with the report",
+    "controls falsely reported 4/4 (2 real engines + 2 self-written sanity checks)",
+    "Excel/Markdown verdicts unreliable; duplicate {context,path} keys silently collapsed by the comparator",
+    "network schema collapses a fully-typed browser session to LEGACY_LOSSY",
+    "legacy VALID shown alongside employeeReady=false"
+  ],
+  "note": "See docs/FINGERPRINT-V4-PLAN.md (v4.2 section) for the 18 mandatory fixes this fixture is the evidence for."
+}

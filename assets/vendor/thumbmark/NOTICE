@@ -1,0 +1,22 @@
+Third-party control engine — ThumbmarkJS
+========================================
+
+File:     thumbmark-1.11.0.umd.js
+Source:   @thumbmarkjs/thumbmarkjs v1.11.0 (npm, pinned)
+License:  MIT (see ./LICENSE) — Copyright (c) 2024 Ilkka
+Use:      Independent, second fingerprint component set, run in the probe as a
+          CONTROL (Codex TZ §7). Its raw components are stored under a separate
+          namespace (control.*); our collector's result does NOT depend on it.
+
+Control-engine roster (corrected per Codex v4 review)
+-----------------------------------------------------
+The minimal control set is FOUR independent engines. Thumbmark is one of them.
+- FingerprintJS OSS **v5 is MIT** (the BSL concern was about v4) — NOW VENDORED
+  alongside Thumbmark. See ../fingerprintjs/NOTICE.md.
+- CreepJS (MIT) — PENDING: extract only the useful raw sections into a renamed,
+  self-hosted adapter under our namespace control.consistency.* (no upstream UI/
+  backend; trademark-safe rename).
+- FPScanner (MIT) — PENDING: verify + pin by commit, adapt the useful checks.
+
+Thumbmark telemetry: sampled logging is disabled (logging:false) so it makes no
+external requests on the measurement stand. See ../../../THIRD_PARTY_NOTICES.md.

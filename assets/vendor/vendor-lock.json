@@ -1,0 +1,54 @@
+{
+  "_comment": "Vendored control-engine provenance (Codex v4.3 #11): upstream source, pinned commit/tag, source SHA-256, build toolchain + command, and the SHA-256 of the shipped output. Verified by scripts/fp-vendor.test.mjs.",
+  "engines": {
+    "thumbmark": {
+      "name": "ThumbmarkJS",
+      "version": "1.11.0",
+      "license": "MIT",
+      "upstream": "https://github.com/thumbmarkjs/thumbmarkjs",
+      "file": "assets/vendor/thumbmark/thumbmark-1.11.0.umd.js",
+      "outputSha256": "5a12ec3d520aa95b7df0e54ab653c9c594cb8d89a430011c01cd1f8a5deb4bae",
+      "build": "upstream prebuilt UMD (vendored as-is)",
+      "patches": []
+    },
+    "fingerprintjs": {
+      "name": "FingerprintJS OSS",
+      "version": "5.0.0",
+      "license": "MIT",
+      "upstream": "https://github.com/fingerprintjs/fingerprintjs",
+      "file": "assets/vendor/fingerprintjs/fp.v5.0.0.umd.min.js",
+      "outputSha256": "d089678feb7cd84853cb5f0266d6568a3c751c3c204545b70c9013c29cc292f1",
+      "build": "upstream prebuilt UMD (vendored as-is)",
+      "patches": []
+    },
+    "fpscanner": {
+      "name": "FPScanner + fp-collect",
+      "version": "fpscanner@0.1.5 + fpcollect@1.0.5",
+      "license": "MIT (+ ua-parser-js 0.7.40 elected MIT)",
+      "upstream": ["https://github.com/antoinevastel/fpscanner", "https://github.com/antoinevastel/fp-collect"],
+      "sources": {
+        "assets/vendor/fpscanner/src/fpCollect.js": "cb9b75f5ff9e4b89351b78b5948fa415e8c18f1f1383104573a495152bdcbeee",
+        "assets/vendor/fpscanner/src/fpScanner.js": "5bee77aee550ba9c76a8607f7c85ffccd45b724e9b3a32d10bf5970258fdfbfa",
+        "assets/vendor/fpscanner/src/ua-parser-0.7.40.js": "95a6709df518be681ad7f8ac624cc5529f1c066d66a33fd1fdc1276d518fd60e"
+      },
+      "toolchain": "esbuild@0.24.0",
+      "buildCommand": "esbuild entry.js --bundle --format=iife --alias:ua-parser-js=./ua-parser.js --minify   (entry: window.fpCollect=require('./fpCollect.js'); window.fpScanner=require('./fpScanner.js'))",
+      "file": "assets/vendor/fpscanner/fpscanner.bundle.js",
+      "outputSha256": "8414f22e6f2466dae55c37b8c8375344679f9469f58590a333d00a16bdc6982c",
+      "patches": ["ua-parser-js pinned 0.7.40 (>=0.7.33, avoids GHSA-fhg7-m89q-25r3; NEVER 1.x/2.x = AGPL)"]
+    },
+    "clientjs": {
+      "name": "ClientJS",
+      "version": "0.2.1",
+      "license": "Apache-2.0",
+      "upstream": "https://github.com/jackspirou/clientjs",
+      "commit": "8f98834b19440cb6bc96048d23b8886d4e32dddc",
+      "tag": "v0.2.1",
+      "toolchain": "webpack (repo config) on node 22, NODE_OPTIONS=--openssl-legacy-provider",
+      "buildCommand": "npm ci --ignore-scripts && npm i --save-exact --ignore-scripts ua-parser-js@0.7.41 && npx webpack -c webpack.config.js",
+      "file": "assets/vendor/clientjs/clientjs-0.2.1.base.min.js",
+      "outputSha256": "5077379fc482d99daeceafb9b63cac07e24f29c6dfba28c445baf3f2ce4d9f22",
+      "patches": ["REBUILT from src with ua-parser-js 0.7.41 (was 0.7.30, GHSA-fhg7-m89q-25r3 / CVE-2022-25927 ReDoS)"]
+    }
+  }
+}

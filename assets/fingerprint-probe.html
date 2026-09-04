@@ -1,0 +1,1853 @@
+<!doctype html><meta charset="utf-8"><title>fingerprint probe</title>
+<style>
+  body{font:13px ui-monospace,Menlo,monospace;background:#0d1117;color:#c9d1d9;margin:0;padding:24px}
+  h3{margin:0 0 4px} p{margin:4px 0 14px;color:#8b949e}
+  #log{white-space:pre-wrap;line-height:1.7}
+  .ok{color:#3fb950}.err{color:#f85149}.big{font-size:15px;color:#58a6ff}
+</style>
+<h3>Сбор браузерного отпечатка</h3>
+<p>Считываем всё, что браузер отдаёт сайтам. Ничего не нажимай — идёт само, 20-40 сек.</p>
+<div id="log"></div>
+<script>
+/* ============================================================================
+   Глубокий сборщик отпечатка.
+
+   Пишется ОДИН раз как функция COLLECTOR(root). Для воркеров/воркета её
+   исходник берётся через .toString() — копии в строке больше нет, править
+   нужно одно место.
+
+   Два принципа:
+   1. Полнота. Помимо точечных активных замеров (canvas/webgl/audio/шрифты)
+      идёт РЕКУРСИВНЫЙ обход navigator/window/screen/document со ЗНАЧЕНИЯМИ
+      каждого свойства. Это ловит любой утёкший параметр, даже неизвестный
+      заранее — ровно то, что антик может «забыть» прикрыть.
+   2. Все контексты. Тот же код гоняется в window, воркерах и audio-worklet:
+      расхождение между контекстами внутри одного браузера — самый дешёвый
+      признак для детекта, и именно там дырявы дешёвые антики.
+   ========================================================================= */
+function COLLECTOR(root){
+  'use strict';
+
+  var S=function(fn){ try{ var v=fn(); return v===undefined?'undef':v; }catch(e){ return 'ERR:'+e.name; } };
+  var A=function(fn){ return Promise.resolve().then(fn).then(function(v){return v===undefined?'undef':v;},function(e){return 'ERR:'+e.name;}); };
+
+  // FNV-1a — синхронный детерминированный хеш, работает во всех realms (в т.ч.
+  // audio-worklet, где нет crypto.subtle). Оставляем как universal fallback.
+  function hash(s){ var h=0x811c9dc5; for(var i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=(h+((h<<1)+(h<<4)+(h<<7)+(h<<8)+(h<<24)))>>>0; } return ('00000000'+h.toString(16)).slice(-8); }
+
+  // SHA-256 через crypto.subtle (secure context; есть в window и воркерах, нет в
+  // audio-worklet). Возвращает hex или null, если недоступно — тогда берём FNV.
+  function sha256(input){
+    return A(function(){
+      try{
+        var buf = (typeof input==='string') ? new TextEncoder().encode(input)
+                : (input && input.buffer ? input : new Uint8Array(input));
+        if(!(root.crypto && root.crypto.subtle)) return null;
+        return root.crypto.subtle.digest('SHA-256', buf).then(function(d){
+          var a=new Uint8Array(d), s=''; for(var i=0;i<a.length;i++) s+=('0'+a[i].toString(16)).slice(-2); return s;
+        }, function(){ return null; });
+      }catch(e){ return null; }
+    });
+  }
+
+  /* ---- ядро: рекурсивный обход объекта со ЗНАЧЕНИЯМИ ------------------- */
+  var NOISE={__proto__:1,__defineGetter__:1,__defineSetter__:1,__lookupGetter__:1,
+    __lookupSetter__:1,constructor:1,hasOwnProperty:1,isPrototypeOf:1,
+    propertyIsEnumerable:1,toLocaleString:1,toString:1,valueOf:1,toJSON:1};
+  var MAX_DEPTH=4, MAX_LEAVES=6000, MAX_ARR=20000;
+
+  // Only VALUE leaves. Functions are NOT values (their shape is captured
+  // separately as a compact _fns inventory), arrays are captured whole, and raw
+  // strings are NEVER truncated (a 512-char cut destroyed fonts/voices/exts).
+  function leaf(v){
+    var t=typeof v;
+    if(v===null) return 'null';
+    if(t==='undefined') return 'undef';
+    if(t==='string') return v;
+    if(t==='number'||t==='boolean'||t==='bigint') return String(v);
+    if(t==='symbol') return v.toString();
+    return null; // object/function — handled by caller
+  }
+
+  function walk(rootObj, label, maxDepth){
+    var out={}, leaves=0, seen=(typeof WeakSet!=='undefined')?new WeakSet():null;
+    var md=maxDepth||MAX_DEPTH;
+    function rec(obj, path, depth){
+      if(leaves>=MAX_LEAVES) return;
+      if(obj===null || (typeof obj!=='object' && typeof obj!=='function')) return;
+      if(seen){ if(seen.has(obj)) return; seen.add(obj); }
+      var names={};
+      for(var o=obj,d=0; o && d<4; o=Object.getPrototypeOf(o),d++){
+        var own=Object.getOwnPropertyNames(o);
+        for(var i=0;i<own.length;i++) if(!NOISE[own[i]]) names[own[i]]=1;
+      }
+      var keys=Object.keys(names).sort(), fns=[];
+      for(var j=0;j<keys.length;j++){
+        var key=keys[j], p=path?path+'.'+key:key, val;
+        try{ val=obj[key]; }catch(e){ out[p]='ERR:'+e.name; leaves++; continue; }
+        if(typeof val==='function'){ fns.push(key); continue; } // shape, not value
+        if(Array.isArray(val)){ // whole array as one leaf — no Array.prototype spam
+          try{ var js=JSON.stringify(val); out[p]= js.length>MAX_ARR? js.slice(0,MAX_ARR):js; }
+          catch(e){ out[p]='[array:'+val.length+']'; }
+          leaves++; continue;
+        }
+        var s=leaf(val);
+        if(s!==null){ out[p]=s; leaves++; }
+        else if(depth<md) rec(val, p, depth+1);
+      }
+      // compact method inventory (underscore → ignored by the value comparison,
+      // but preserved in raw for cross-realm shape analysis).
+      if(fns.length){ out[(path?path+'.':'')+'_fns']=fns.sort().join(','); leaves++; }
+    }
+    rec(rootObj, label, 0);
+    return out;
+  }
+
+  /* ---- ТИПИЗИРОВАННЫЙ envelope (source of truth, Codex v4 §Типизация) ----
+   * encodeValue keeps native types at collection time: false ≠ "false",
+   * null ≠ "null", NaN/Infinity/-0/bigint explicit, arrays stay arrays
+   * (count===length), objects stay objects, Error/typed-array structured.
+   * SINGLE SOURCE: lib/fp-encode.mjs, injected below and imported by the test. */
+  var STATUS={ok:'ok',unsupported:'unsupported',unavailableInContext:'unavailable-in-context',
+    permissionRequired:'permission-required',permissionDenied:'permission-denied',blocked:'blocked',
+    timeout:'timeout',error:'error',invalidResult:'invalid-result'};
+  // encodeValue / fnv1a / bytesHash are INJECTED here from lib/fp-encode.mjs by
+  // the serving routes (probe + collector), so the browser runs the SAME source
+  // the unit test imports — no copy to drift (Codex v4.2 #2). The injection point
+  // is INSIDE COLLECTOR so COLLECTOR.toString() carries it into every worker /
+  // iframe / OOPIF realm unchanged.
+  /*__FP_ENCODE_INJECT__*/
+  if(typeof encodeValue==='undefined'){ throw new Error('fp-encode not injected'); }
+  // Typed deep-walk over a live native object → array of measurement records
+  // {path,context,phase,status,valueType,value,error,meta}. Reads the SAME
+  // getters as walk() but preserves native types instead of stringifying.
+  function walkTyped(rootObj,label,context,phase,recs,maxDepth){
+    var md=maxDepth||MAX_DEPTH, seen=(typeof WeakSet!=='undefined')?new WeakSet():null, n=0;
+    function push(p,status,enc,error){
+      var m={}; if(enc&&enc.special)m.special=enc.special; if(enc&&enc.count!=null)m.count=enc.count;
+      recs.push({path:p,context:context,phase:phase,status:status,
+        valueType:enc?enc.valueType:null,value:enc?enc.value:null,error:error||null,meta:m});
+      n++;
+    }
+    function rec(obj,path,depth){
+      if(n>=MAX_LEAVES) return;
+      if(obj===null||(typeof obj!=='object'&&typeof obj!=='function')) return;
+      if(seen){ if(seen.has(obj)) return; seen.add(obj); }
+      var names={};
+      for(var o=obj,d=0;o&&d<4;o=Object.getPrototypeOf(o),d++){
+        var own=Object.getOwnPropertyNames(o);
+        for(var i=0;i<own.length;i++) if(!NOISE[own[i]]) names[own[i]]=1;
+      }
+      var keys=Object.keys(names).sort();
+      for(var j=0;j<keys.length;j++){
+        var key=keys[j], p=path?path+'.'+key:key, val, threw=null;
+        try{ val=obj[key]; }catch(e){ threw=e; }
+        // A SecurityError from a getter is an access DENIAL (opaque/sandboxed
+        // realm), not a bug — normalise to `blocked` like M() does (Codex v4.3 #2).
+        if(threw){ push(p, threw.name==='SecurityError'?STATUS.blocked:STATUS.error, null, {name:threw.name,message:threw.message}); continue; }
+        var tv=typeof val;
+        var isSpecialObj = val && tv==='object' && (val instanceof Error ||
+          (typeof ArrayBuffer!=='undefined' && (val instanceof ArrayBuffer || (ArrayBuffer.isView&&ArrayBuffer.isView(val)))));
+        if(tv==='object' && val!==null && !Array.isArray(val) && !isSpecialObj && depth<md){
+          rec(val,p,depth+1); continue;
+        }
+        push(p,STATUS.ok,encodeValue(val),null);
+      }
+    }
+    rec(rootObj,label,0);
+  }
+
+  // Current collect() context/phase + the typed record sink. Set at the start of
+  // collect(); M()/MA() push into CUR.recs while blocks run.
+  var CUR={context:'main-frame',phase:'passive',recs:null};
+  function nowMs(){ return (root.performance&&root.performance.now)?root.performance.now():Date.now(); }
+  function pushRec(path,status,enc,error,dur){
+    if(!CUR.recs) return;
+    var m={durationMs:+(dur||0).toFixed(3)};
+    if(enc){ if(enc.special)m.special=enc.special; if(enc.count!=null)m.count=enc.count; }
+    CUR.recs.push({path:path,context:CUR.context,phase:CUR.phase,status:status,
+      valueType:enc?enc.valueType:null,value:enc?enc.value:null,error:error||null,meta:m});
+  }
+  // A probe returns MSTATUS.x to declare an explicit non-ok status (feature not
+  // in this realm, unsupported, needs permission, blocked) instead of a fake
+  // value — maps to the closed status enum, value stays null.
+  var MSTATUS={
+    unsupported:{__mstatus:STATUS.unsupported},
+    unavailable:{__mstatus:STATUS.unavailableInContext},
+    permissionRequired:{__mstatus:STATUS.permissionRequired},
+    permissionDenied:{__mstatus:STATUS.permissionDenied},
+    blocked:{__mstatus:STATUS.blocked},
+    invalid:{__mstatus:STATUS.invalidResult},
+  };
+  // Sync measure: emit a TYPED record AND return the legacy sentinel value so the
+  // old string map keeps working. undefined → 'ok'/valueType 'undefined'; a thrown
+  // probe → 'error' + structured error; an MSTATUS marker → that explicit status.
+  function M(path,fn){
+    var t0=nowMs(),legacy,enc=null,status=STATUS.ok,error=null;
+    try{
+      var v=fn();
+      if(v&&typeof v==='object'&&v.__mstatus){ status=v.__mstatus; enc={valueType:'null',value:null}; legacy=v.__mstatus; }
+      else { legacy=(v===undefined?'undef':v); enc=encodeValue(v); }
+    }
+    catch(e){
+      // A SecurityError is an ACCESS DENIAL (policy / opaque origin / disabled
+      // API), not a bug — normalise it to the terminal `blocked` status so a
+      // restricted realm doesn't read as a broken probe (Codex v4.2 #6). Any
+      // OTHER thrown error stays `error` and blocks readiness.
+      status=(e&&e.name==='SecurityError')?STATUS.blocked:STATUS.error;
+      error={name:e&&e.name,message:e&&e.message,stack:e&&e.stack};
+      legacy='ERR:'+(e&&e.name);
+    }
+    pushRec(path,status,enc,error,nowMs()-t0);
+    return legacy;
+  }
+  // Async measure (returns a Promise of the legacy value).
+  function MA(path,fn){
+    var t0=nowMs();
+    return Promise.resolve().then(fn).then(function(v){
+      pushRec(path,STATUS.ok,encodeValue(v),null,nowMs()-t0);
+      return v===undefined?'undef':v;
+    },function(e){
+      // SecurityError → blocked (access denial, not a bug); else error (Codex #6).
+      var st=(e&&e.name==='SecurityError')?STATUS.blocked:STATUS.error;
+      pushRec(path,st,null,{name:e&&e.name,message:e&&e.message,stack:e&&e.stack},nowMs()-t0);
+      return 'ERR:'+(e&&e.name);
+    });
+  }
+
+  /* ---- глубокие цели (значения каждого свойства) ----------------------- */
+  function deepBlock(){
+    var m={};
+    var nav = root.navigator;
+    if(nav) Object.assign(m, walk(nav,'navigator'));
+    var scr = root.screen;
+    if(scr) Object.assign(m, walk(scr,'screen'));
+    // window/self — только верхний уровень (глубокий обход утащил бы весь DOM);
+    // сам список глобалей — это уже отпечаток.
+    Object.assign(m, walk({ globals: (function(){ try{ return Object.getOwnPropertyNames(root).sort().join(','); }catch(e){ return 'ERR'; } })() }, 'window', 1));
+    if(typeof document!=='undefined' && document){
+      m['document.characterSet']=S(function(){return document.characterSet;});
+      m['document.compatMode']=S(function(){return document.compatMode;});
+      m['document.referrer']=S(function(){return document.referrer;});
+      m['document.visibilityState']=S(function(){return document.visibilityState;});
+    }
+    return m;
+  }
+
+  /* ---- локаль / время -------------------------------------------------- */
+  function localeBlock(){
+    return {
+      resolvedTZ:M('locale.resolvedTZ',function(){return Intl.DateTimeFormat().resolvedOptions().timeZone;}),
+      resolvedLocale:M('locale.resolvedLocale',function(){return Intl.DateTimeFormat().resolvedOptions().locale;}),
+      calendar:M('locale.calendar',function(){return Intl.DateTimeFormat().resolvedOptions().calendar;}),
+      numberingSystem:M('locale.numberingSystem',function(){return Intl.DateTimeFormat().resolvedOptions().numberingSystem;}),
+      tzOffset:M('locale.tzOffset',function(){return new Date().getTimezoneOffset();}),
+      dtfWinter:M('locale.dtfWinter',function(){return new Date(2021,0,1).toString();}),
+      dtfSummer:M('locale.dtfSummer',function(){return new Date(2021,6,1).toString();}),
+      dateToLocale:M('locale.dateToLocale',function(){return new Date(0).toLocaleString();}),
+      numberToLocale:M('locale.numberToLocale',function(){return (1234567.89).toLocaleString();}),
+      relativeTime:M('locale.relativeTime',function(){return new Intl.RelativeTimeFormat().format(-1,'day');}),
+      collator:M('locale.collator',function(){return ['ä','a','z','Z','1','ﬀ'].sort(new Intl.Collator().compare).join('');}),
+      // FIX (Codex P2): actually FORMAT with ListFormat instead of returning
+      // typeof — the discriminating value is the joined output, not "function".
+      listFormat:M('locale.listFormat',function(){
+        if(typeof Intl==='undefined'||typeof Intl.ListFormat!=='function') return undefined;
+        return new Intl.ListFormat(undefined,{style:'long',type:'conjunction'}).format(['a','b','c']);
+      }),
+      pluralRules:M('locale.pluralRules',function(){return new Intl.PluralRules().select(2);}),
+      // FIX (Codex P2): return the real firstDay, or undefined when weekInfo is
+      // unsupported — the typed layer records that as valueType 'undefined',
+      // no more "undef" string masquerading as a value.
+      firstWeekday:M('locale.firstWeekday',function(){
+        var wi=(new Intl.Locale(navigator.language)).weekInfo;
+        return wi?wi.firstDay:undefined;
+      }),
+    };
+  }
+
+  /* ---- canvas 2D ------------------------------------------------------- */
+  // A real canvas in every realm: HTMLCanvasElement in a document, OffscreenCanvas
+  // in workers. Shared by the canvas and WebGL blocks.
+  function makeCanvas(w,h){
+    if(typeof document!=='undefined' && document.createElement){
+      var c=document.createElement('canvas'); c.width=w; c.height=h; return c;
+    }
+    if(typeof OffscreenCanvas!=='undefined') return new OffscreenCanvas(w,h);
+    return null;
+  }
+  // P3 (Codex): the same deterministic scene, drawn on a fresh canvas each call →
+  // exact inputs, real pixels, input-length, SHA-256, THREE internal repeats and a
+  // stability flag, explicit errors. Repeats run in one user visit.
+  function canvasDraw(){
+    var cv=makeCanvas(280,60);
+    if(!cv) return {status:'unavailable'};
+    var ctx=cv.getContext&&cv.getContext('2d'); if(!ctx) return {status:'unsupported'};
+    ctx.textBaseline='alphabetic'; ctx.fillStyle='#f60'; ctx.fillRect(1,1,100,40);
+    ctx.fillStyle='#069'; ctx.font='11pt no-real-font-123'; ctx.fillText('Cwm fjord 😀 véy',2,15);
+    ctx.fillStyle='rgba(102,204,0,0.7)'; ctx.font='18pt Arial'; ctx.fillText('Cwm fjord 😀 véy',4,45);
+    ctx.globalCompositeOperation='multiply';
+    ctx.fillStyle='rgb(255,0,255)'; ctx.beginPath(); ctx.arc(50,25,20,0,Math.PI*2,true); ctx.fill();
+    var px; try{ px=ctx.getImageData(0,0,cv.width,cv.height).data; }catch(e){ return {status:'invalid', err:e}; }
+    return {status:'ok', cv:cv, ctx:ctx, px:px};
+  }
+  function pixFnv(px){ var s=''; for(var i=0;i<px.length;i+=97) s+=px[i]+','; return hash(s); }
+  function canvasBlock(){
+    return A(function(){
+      var first=canvasDraw();
+      if(first.status==='unavailable') return {status:M('canvas.status',function(){return MSTATUS.unavailable;})};
+      if(first.status==='unsupported') return {status:M('canvas.status',function(){return MSTATUS.unsupported;})};
+      if(first.status==='invalid') return {status:M('canvas.status',function(){ throw first.err; })};
+      var px=first.px, cv=first.cv;
+      // 3 internal repeats → stability/variance
+      var fnvs=[pixFnv(px)];
+      for(var rr=0; rr<2; rr++){ var d=canvasDraw(); fnvs.push(d.px?pixFnv(d.px):null); }
+      var stable = fnvs[0]===fnvs[1] && fnvs[1]===fnvs[2];
+      var winding=M('canvas.winding',function(){ return first.ctx.isPointInPath(5,5,'evenodd'); });
+      var encP;
+      if(cv.toDataURL){ var du=S(function(){return cv.toDataURL();}); encP=Promise.resolve((typeof du==='string'&&du.indexOf('data:')===0)?{fmt:'dataURL',len:du.length}:{fmt:'err',len:0}); }
+      else if(cv.convertToBlob){ encP=cv.convertToBlob().then(function(b){return {fmt:'blob',len:b.size};},function(){return {fmt:'err',len:0};}); }
+      else encP=Promise.resolve({fmt:'none',len:0});
+      return Promise.all([sha256(px), encP]).then(function(r){
+        M('canvas.width',function(){return cv.width;});
+        M('canvas.height',function(){return cv.height;});
+        M('canvas.pixelBytes',function(){return px.length;});        // input length
+        M('canvas.pixelFnv',function(){return fnvs[0];});
+        M('canvas.pixelSha256',function(){return r[0]||undefined;}); // raw output digest
+        M('canvas.encFmt',function(){return r[1].fmt;});
+        M('canvas.encLen',function(){return r[1].len;});
+        M('canvas.repeats',function(){return fnvs;});                // array of 3 (Codex: repeats)
+        M('canvas.stable',function(){return stable;});               // stability/variance
+        return { status:'ok', width:cv.width, height:cv.height, winding:winding,
+          pixelBytes:px.length, pixelFnv:fnvs[0], pixelSha256:r[0]||'n/a',
+          encFmt:r[1].fmt, encLen:r[1].len, repeats:fnvs.join(','), stable:String(stable) };
+      });
+    });
+  }
+
+  /* ---- WebGL / WebGL2 — исчерпывающе --------------------------------- */
+  var GL_PARAMS=['ACTIVE_TEXTURE','ALIASED_LINE_WIDTH_RANGE','ALIASED_POINT_SIZE_RANGE',
+    'ALPHA_BITS','BLUE_BITS','DEPTH_BITS','GREEN_BITS','RED_BITS','STENCIL_BITS',
+    'MAX_COMBINED_TEXTURE_IMAGE_UNITS','MAX_CUBE_MAP_TEXTURE_SIZE','MAX_FRAGMENT_UNIFORM_VECTORS',
+    'MAX_RENDERBUFFER_SIZE','MAX_TEXTURE_IMAGE_UNITS','MAX_TEXTURE_SIZE','MAX_VARYING_VECTORS',
+    'MAX_VERTEX_ATTRIBS','MAX_VERTEX_TEXTURE_IMAGE_UNITS','MAX_VERTEX_UNIFORM_VECTORS',
+    'MAX_VIEWPORT_DIMS','RENDERER','SHADING_LANGUAGE_VERSION','VENDOR','VERSION',
+    'MAX_TEXTURE_MAX_ANISOTROPY_EXT',
+    // WebGL2
+    'MAX_3D_TEXTURE_SIZE','MAX_ARRAY_TEXTURE_LAYERS','MAX_COLOR_ATTACHMENTS',
+    'MAX_COMBINED_FRAGMENT_UNIFORM_COMPONENTS','MAX_COMBINED_UNIFORM_BLOCKS',
+    'MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS','MAX_DRAW_BUFFERS','MAX_ELEMENT_INDEX',
+    'MAX_ELEMENTS_INDICES','MAX_ELEMENTS_VERTICES','MAX_FRAGMENT_INPUT_COMPONENTS',
+    'MAX_FRAGMENT_UNIFORM_BLOCKS','MAX_FRAGMENT_UNIFORM_COMPONENTS','MAX_PROGRAM_TEXEL_OFFSET',
+    'MAX_SAMPLES','MAX_TEXTURE_LOD_BIAS','MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS',
+    'MAX_UNIFORM_BLOCK_SIZE','MAX_UNIFORM_BUFFER_BINDINGS','MAX_VARYING_COMPONENTS',
+    'MAX_VERTEX_OUTPUT_COMPONENTS','MAX_VERTEX_UNIFORM_BLOCKS','MAX_VERTEX_UNIFORM_COMPONENTS'];
+  // Render a scene and read the pixels back — what the GPU+driver actually
+  // produce, distinct from what getParameter claims. Returns the raw pixels so
+  // the caller can hash them (FNV sync + SHA-256), plus compile/link/gl status.
+  function glRender(gl){
+    try{
+      var vs=gl.createShader(gl.VERTEX_SHADER);
+      gl.shaderSource(vs,'attribute vec2 p;varying vec2 v;void main(){v=p;gl_Position=vec4(p,0.0,1.0);}');
+      gl.compileShader(vs);
+      var vsOk=gl.getShaderParameter(vs,gl.COMPILE_STATUS);
+      var fs=gl.createShader(gl.FRAGMENT_SHADER);
+      gl.shaderSource(fs,'precision highp float;varying vec2 v;void main(){gl_FragColor=vec4(abs(sin(v.x*12.0)),abs(cos(v.y*9.0)),fract(v.x*v.y*7.0),1.0);}');
+      gl.compileShader(fs);
+      var fsOk=gl.getShaderParameter(fs,gl.COMPILE_STATUS);
+      var pr=gl.createProgram(); gl.attachShader(pr,vs); gl.attachShader(pr,fs); gl.linkProgram(pr);
+      var linkOk=gl.getProgramParameter(pr,gl.LINK_STATUS); gl.useProgram(pr);
+      var buf=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+      gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+      var loc=gl.getAttribLocation(pr,'p'); gl.enableVertexAttribArray(loc);
+      gl.vertexAttribPointer(loc,2,gl.FLOAT,false,0,0);
+      gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+      var w=gl.drawingBufferWidth,h=gl.drawingBufferHeight;
+      var px=new Uint8Array(w*h*4); gl.readPixels(0,0,w,h,gl.RGBA,gl.UNSIGNED_BYTE,px);
+      return { ok:true, w:w, h:h, px:px, compile:(vsOk&&fsOk?'ok':'fail'), link:(linkOk?'ok':'fail'), glError:gl.getError() };
+    }catch(e){ return { ok:false, error:'ERR:'+e.name }; }
+  }
+  function glContext(name){
+    var cv=makeCanvas(64,64); if(!cv||!cv.getContext) return null;
+    try{ return cv.getContext(name); }catch(e){ return null; }
+  }
+  function glFnv(px,w,h){ var s=''; for(var i=0;i<px.length;i+=131) s+=px[i]; return hash(s+'|'+w+'x'+h); }
+  function glBlock(){
+    return A(function(){
+      var out={}, jobs=[];
+      // A FRESH canvas per context type — one canvas can't hand out both webgl
+      // and webgl2, which is why webgl1 used to come back "n/a".
+      ['webgl2','webgl'].forEach(function(name){
+        var gl=glContext(name);
+        if(!gl){ out[name]={status:M('webgl.'+name+'.status',function(){return MSTATUS.unsupported;})}; return; }
+        var dbg=null; try{ dbg=gl.getExtension('WEBGL_debug_renderer_info'); }catch(e){}
+        var g={};
+        GL_PARAMS.forEach(function(k){ if(gl[k]!==undefined) g[k]=M('webgl.'+name+'.params.'+k,function(){ var v=gl.getParameter(gl[k]); return (v&&v.length!==undefined&&typeof v!=='string')?Array.prototype.slice.call(v).join(','):v; }); });
+        var prec={};
+        ['VERTEX_SHADER','FRAGMENT_SHADER'].forEach(function(st){
+          ['HIGH_FLOAT','MEDIUM_FLOAT','LOW_FLOAT','HIGH_INT','MEDIUM_INT','LOW_INT'].forEach(function(pt){
+            prec[st+'.'+pt]=M('webgl.'+name+'.precision.'+st+'.'+pt,function(){ var r=gl.getShaderPrecisionFormat(gl[st],gl[pt]); return r.rangeMin+','+r.rangeMax+','+r.precision; });
+          });
+        });
+        // 3 render repeats → stability (P3)
+        var r=glRender(gl), renderFnvs=[];
+        if(r.ok){ renderFnvs.push(glFnv(r.px,r.w,r.h)); for(var rr=0;rr<2;rr++){ var r2=glRender(gl); renderFnvs.push(r2.ok?glFnv(r2.px,r2.w,r2.h):null); } }
+        var stable = r.ok && renderFnvs[0]===renderFnvs[1] && renderFnvs[1]===renderFnvs[2];
+        M('webgl.'+name+'.render.fnv',function(){return r.ok?renderFnvs[0]:undefined;});
+        M('webgl.'+name+'.render.compile',function(){return r.ok?r.compile:undefined;});
+        M('webgl.'+name+'.render.link',function(){return r.ok?r.link:undefined;});
+        M('webgl.'+name+'.render.glError',function(){return r.ok?r.glError:undefined;});
+        M('webgl.'+name+'.render.pixelBytes',function(){return r.ok?r.px.length:undefined;});
+        M('webgl.'+name+'.render.stable',function(){return stable;});
+        M('webgl.'+name+'.render.repeats',function(){return renderFnvs;});
+        if(!r.ok) M('webgl.'+name+'.render.error',function(){return r.error;});
+        var entry={
+          status:'ok',
+          unmaskedVendor: M('webgl.'+name+'.unmaskedVendor',function(){return dbg?gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL):MSTATUS.unavailable;}),
+          unmaskedRenderer: M('webgl.'+name+'.unmaskedRenderer',function(){return dbg?gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL):MSTATUS.unavailable;}),
+          params: g, precision: prec,
+          render: r.ok?{w:r.w,h:r.h,fnv:renderFnvs[0],compile:r.compile,link:r.link,glError:r.glError,stable:String(stable),repeats:renderFnvs.join(',')}:{error:r.error},
+          extensions: M('webgl.'+name+'.extensions',function(){ return (gl.getSupportedExtensions()||[]).sort().join(','); }),
+          contextAttrs: M('webgl.'+name+'.contextAttrs',function(){ return JSON.stringify(gl.getContextAttributes()); }),
+        };
+        out[name]=entry;
+        if(r.ok) jobs.push(sha256(r.px).then(function(hx){ entry.render.sha256=hx||'n/a'; M('webgl.'+name+'.render.sha256',function(){return hx||undefined;}); }));
+      });
+      return Promise.all(jobs).then(function(){ return out; });
+    });
+  }
+
+  /* ---- WebGPU ---------------------------------------------------------- */
+  function gpuBlock(){
+    return A(function(){
+      var gp=root.navigator&&root.navigator.gpu;
+      if(!gp) return {available:M('webgpu.available',function(){return MSTATUS.unsupported;})};
+      // Real GPU compute (Codex P3): a WGSL compute shader writes a deterministic
+      // f32 pattern to a storage buffer, read back + hashed → what the GPU+driver
+      // actually COMPUTE, plus shader compile messages. Best-effort, 6s timeout.
+      function computeProbe(ad){
+        return Promise.resolve(ad.requestDevice()).then(function(dev){
+          if(!dev) return { status:'no-device' };
+          var N=64, wgsl=
+            '@group(0) @binding(0) var<storage, read_write> data: array<f32>;'
+            +'@compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id: vec3<u32>){'
+            +'let i=id.x; data[i]=sin(f32(i)*0.1)+cos(f32(i)*0.033)+tanh(f32(i)*0.005);}';
+          var mod=dev.createShaderModule({code:wgsl});
+          var pipe=dev.createComputePipeline({layout:'auto',compute:{module:mod,entryPoint:'main'}});
+          var bytes=N*4;
+          var buf=dev.createBuffer({size:bytes,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC});
+          var read=dev.createBuffer({size:bytes,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+          var bg=dev.createBindGroup({layout:pipe.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:buf}}]});
+          var enc=dev.createCommandEncoder(); var pass=enc.beginComputePass();
+          pass.setPipeline(pipe); pass.setBindGroup(0,bg); pass.dispatchWorkgroups(N); pass.end();
+          enc.copyBufferToBuffer(buf,0,read,0,bytes); dev.queue.submit([enc.finish()]);
+          return read.mapAsync(GPUMapMode.READ).then(function(){
+            var arr=new Float32Array(read.getMappedRange().slice(0)); read.unmap();
+            var s=''; for(var i=0;i<arr.length;i++) s+=Math.round(arr[i]*1e6)/1e6+',';
+            return Promise.resolve(mod.getCompilationInfo?mod.getCompilationInfo():null).then(function(ci){
+              M('webgpu.compute.hash',function(){return hash(s);});
+              M('webgpu.compute.len',function(){return arr.length;});
+              M('webgpu.compute.compileMessages',function(){return ci&&ci.messages?ci.messages.length:0;});
+              try{ dev.destroy&&dev.destroy(); }catch(_){}
+              return { status:'ok', hash:hash(s), len:arr.length };
+            });
+          });
+        });
+      }
+      // Real GPU RENDER pass (Codex v4.2 #15): render a deterministic pattern to a
+      // 64×64 rgba8 texture (row = 64*4 = 256 B, the copy alignment), read the
+      // pixels back and hash them — exercises the RENDER pipeline (rasteriser +
+      // fragment stage), distinct from compute. Uses its OWN adapter+device so it
+      // is fully isolated from the compute probe; watches device-lost.
+      function renderProbe(gp2){
+        return Promise.resolve(gp2.requestAdapter&&gp2.requestAdapter()).then(function(ad2){
+          if(!ad2) return { status:'no-adapter' };
+          return Promise.resolve(ad2.requestDevice()).then(function(dev){
+            if(!dev) return { status:'no-device' };
+            var lost=false; try{ if(dev.lost&&dev.lost.then) dev.lost.then(function(){lost=true;}); }catch(_){}
+            var W=64, wgsl=
+              '@vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{'
+              +'var p=array<vec2f,3>(vec2f(-1.,-1.),vec2f(3.,-1.),vec2f(-1.,3.));return vec4f(p[i],0.,1.);}'
+              +'@fragment fn fs(@builtin(position) c:vec4f)->@location(0) vec4f{'
+              +'let u=c.xy/64.;let n=fract(sin(u.x*12.9898+u.y*78.233)*43758.5453);return vec4f(n,u.x,u.y,1.);}';
+            var mod=dev.createShaderModule({code:wgsl});
+            var pipe=dev.createRenderPipeline({layout:'auto',vertex:{module:mod,entryPoint:'vs'},fragment:{module:mod,entryPoint:'fs',targets:[{format:'rgba8unorm'}]},primitive:{topology:'triangle-list'}});
+            var tex=dev.createTexture({size:[W,W],format:'rgba8unorm',usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.COPY_SRC});
+            var bpr=W*4, readBuf=dev.createBuffer({size:bpr*W,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+            var enc=dev.createCommandEncoder();
+            var rp=enc.beginRenderPass({colorAttachments:[{view:tex.createView(),clearValue:{r:0,g:0,b:0,a:1},loadOp:'clear',storeOp:'store'}]});
+            rp.setPipeline(pipe); rp.draw(3); rp.end();
+            enc.copyTextureToBuffer({texture:tex},{buffer:readBuf,bytesPerRow:bpr,rowsPerImage:W},[W,W,1]);
+            dev.queue.submit([enc.finish()]);
+            return readBuf.mapAsync(GPUMapMode.READ).then(function(){
+              var px=new Uint8Array(readBuf.getMappedRange().slice(0)); readBuf.unmap();
+              var s=''; for(var i=0;i<px.length;i+=97) s+=px[i]+',';   // sample → compact stable string
+              return Promise.resolve(mod.getCompilationInfo?mod.getCompilationInfo():null).then(function(ci){
+                M('webgpu.render.hash',function(){return hash(s);});
+                M('webgpu.render.pixelBytes',function(){return px.length;});
+                M('webgpu.render.compileMessages',function(){return ci&&ci.messages?ci.messages.length:0;});
+                M('webgpu.render.deviceLost',function(){return lost;});
+                try{ dev.destroy&&dev.destroy(); }catch(_){}
+                return { status:'ok', hash:hash(s) };
+              });
+            });
+          });
+        });
+      }
+      // requestAdapter() itself has NO timeout in the spec, and in a subframe/
+      // OOPIF where WebGPU is disabled by Permissions-Policy it can return a
+      // promise that NEVER settles — which used to hang the whole realm's
+      // Promise.all past its harness timeout. Race it: a non-settling adapter
+      // request resolves to blocked (policy) instead of hanging the realm.
+      var adReq; try{ adReq=gp.requestAdapter&&gp.requestAdapter(); }catch(e){ adReq=null; }
+      var adRace=new Promise(function(res){ setTimeout(function(){ res('__adapter-timeout'); },5000); });
+      return Promise.race([Promise.resolve(adReq),adRace]).then(function(ad){
+        if(ad==='__adapter-timeout') return {status:M('webgpu.status',function(){return MSTATUS.blocked;})};
+        if(!ad) return {status:M('webgpu.status',function(){return MSTATUS.unavailable;})};
+        var info=ad.info||{};
+        var lim={}; try{ for(var k in ad.limits){ lim[k]=M('webgpu.limits.'+k,(function(kk){return function(){return ad.limits[kk];};})(k)); } }catch(e){}
+        var base={
+          status:'ok',
+          features:M('webgpu.features',function(){ return Array.from(ad.features||[]).sort().join(','); }),
+          limits:lim,
+          // isFallbackAdapter was removed from the WebGPU spec → genuinely undefined.
+          isFallback:M('webgpu.isFallback',function(){return ad.isFallbackAdapter;}),
+          vendor:M('webgpu.vendor',function(){return info.vendor;}),
+          architecture:M('webgpu.architecture',function(){return info.architecture;}),
+          device:M('webgpu.device',function(){return info.device;}),
+          description:M('webgpu.description',function(){return info.description;}),
+          wgslFeatures:M('webgpu.wgslFeatures',function(){ return gp.wgslLanguageFeatures?Array.from(gp.wgslLanguageFeatures).sort().join(','):undefined; }),
+          preferredFormat:M('webgpu.preferredFormat',function(){return gp.getPreferredCanvasFormat&&gp.getPreferredCanvasFormat();}),
+        };
+        var timeout=new Promise(function(_,rej){ setTimeout(function(){rej(new Error('timeout'));},6000); });
+        return Promise.race([computeProbe(ad),timeout]).then(function(cp){ base.compute=cp; M('webgpu.compute.status',function(){return cp&&cp.status;}); },
+          function(e){ base.compute={status:'error'}; M('webgpu.compute.status',function(){ throw e; }); }).then(function(){
+          // RENDER pass — own adapter/device + own timeout, fully isolated so it
+          // can never disturb the compute result above (Codex v4.2 #15).
+          var rTimeout=new Promise(function(res){ setTimeout(function(){res({status:'timeout'});},6000); });
+          return Promise.race([renderProbe(gp),rTimeout]).then(function(rp){ base.render=rp; M('webgpu.render.status',function(){return rp&&rp.status;}); return base; },
+            function(){ base.render={status:'error'}; M('webgpu.render.status',function(){return 'error';}); return base; });
+        });
+      });
+    });
+  }
+
+  /* ---- аудио ----------------------------------------------------------- */
+  // One deterministic OfflineAudioContext render (same graph each call).
+  function renderAudioOnce(){
+    return new Promise(function(res){
+      var OAC=root.OfflineAudioContext||root.webkitOfflineAudioContext;
+      if(!OAC){ res(null); return; }
+      var ctx=new OAC(1,5000,44100);
+      var osc=ctx.createOscillator(); osc.type='triangle'; osc.frequency.value=10000;
+      var comp=ctx.createDynamicsCompressor();
+      [['threshold',-50],['knee',40],['ratio',12],['attack',0],['release',0.25]].forEach(function(kv){
+        try{ comp[kv[0]].value=kv[1]; }catch(e){}
+      });
+      osc.connect(comp); comp.connect(ctx.destination); osc.start(0);
+      ctx.oncomplete=function(e){
+        var buf=e.renderedBuffer.getChannelData(0), sum=0;
+        for(var i=0;i<buf.length;i++) sum+=Math.abs(buf[i]);
+        res({ sum:sum, hash:hash(Array.prototype.slice.call(buf,4000,4200).join(',')), sampleRate:ctx.sampleRate, bufLen:buf.length });
+      };
+      ctx.startRendering();
+      setTimeout(function(){res({timeout:true});},4000);
+    });
+  }
+  function audioBlock(){
+    return A(function(){
+      var OAC=root.OfflineAudioContext||root.webkitOfflineAudioContext;
+      if(!OAC) return {available:M('audio.available',function(){return MSTATUS.unavailable;})};
+      return renderAudioOnce().then(function(a){
+        if(!a||a.timeout) return {status:M('audio.status',function(){return MSTATUS.timeout;})};
+        return Promise.all([renderAudioOnce(),renderAudioOnce()]).then(function(more){ // P3 repeats
+          var hashes=[a.hash, more[0]&&more[0].hash, more[1]&&more[1].hash];
+          var stable = hashes[0]===hashes[1] && hashes[1]===hashes[2];
+          M('audio.offline.sum',function(){return a.sum;});
+          M('audio.offline.hash',function(){return a.hash;});
+          M('audio.offline.bufLen',function(){return a.bufLen;});     // input length
+          M('audio.offline.sampleRate',function(){return a.sampleRate;});
+          M('audio.offline.stable',function(){return stable;});
+          M('audio.offline.repeats',function(){return hashes;});
+          // realtime is a SEPARATE audio path (Codex: offline/realtime/worklet split)
+          M('audio.realtime.baseLatency',function(){ return (new (root.AudioContext||root.webkitAudioContext)()).baseLatency; });
+          return { status:'ok', sum:String(a.sum), hash:a.hash, sampleRate:String(a.sampleRate),
+            stable:String(stable), repeats:hashes.join(',') };
+        });
+      });
+    });
+  }
+
+  /* ---- шрифты (широкий список) ---------------------------------------- */
+  var FONT_LIST=('Arial,Arial Black,Arial Narrow,Arial Rounded MT Bold,Bahnschrift,Calibri,'
+    +'Cambria,Cambria Math,Candara,Comic Sans MS,Consolas,Constantia,Corbel,Courier New,'
+    +'Ebrima,Franklin Gothic Medium,Gabriola,Gadugi,Georgia,HoloLens MDL2 Assets,Impact,'
+    +'Ink Free,Javanese Text,Leelawadee UI,Lucida Console,Lucida Sans Unicode,MS Gothic,'
+    +'MV Boli,Malgun Gothic,Marlett,Microsoft Himalaya,Microsoft JhengHei,Microsoft New Tai Lue,'
+    +'Microsoft PhagsPa,Microsoft Sans Serif,Microsoft Tai Le,Microsoft YaHei,Microsoft Yi Baiti,'
+    +'MingLiU-ExtB,Mongolian Baiti,Myanmar Text,Nirmala UI,Palatino Linotype,Segoe MDL2 Assets,'
+    +'Segoe Print,Segoe Script,Segoe UI,Segoe UI Emoji,Segoe UI Historic,Segoe UI Symbol,'
+    +'SimSun,Sitka,Sylfaen,Symbol,Tahoma,Times New Roman,Trebuchet MS,Verdana,Webdings,Wingdings,'
+    +'Yu Gothic,Menlo,Monaco,Helvetica,Helvetica Neue,Geneva,Optima,Futura,Baskerville,'
+    +'American Typewriter,Andale Mono,Apple Chancery,Apple Color Emoji,Avenir,Avenir Next,'
+    +'Big Caslon,Brush Script MT,Chalkboard,Chalkduster,Cochin,Copperplate,Didot,'
+    +'Hoefler Text,Marker Felt,Noteworthy,Papyrus,Phosphate,Rockwell,Savoye LET,SignPainter,'
+    +'Skia,Snell Roundhand,Trattatello,Ubuntu,Cantarell,DejaVu Sans,Liberation Sans,'
+    +'Roboto,Noto Sans,Droid Sans,FreeSans,Nimbus Sans').split(',');
+  function fontBlock(){
+    if(typeof document==='undefined') return {available:M('fonts.available',function(){return MSTATUS.unavailable;})};
+    var present=[];
+    try{
+      var base=['monospace','sans-serif','serif'], span=document.createElement('span');
+      span.style.cssText='position:absolute;left:-9999px;font-size:72px'; span.textContent='mmmmmmmmmmlli';
+      document.body.appendChild(span);
+      var def={};
+      base.forEach(function(b){ span.style.fontFamily=b; def[b]={w:span.offsetWidth,h:span.offsetHeight}; });
+      FONT_LIST.forEach(function(f){
+        for(var i=0;i<base.length;i++){
+          span.style.fontFamily="'"+f+"',"+base[i];
+          if(span.offsetWidth!==def[base[i]].w || span.offsetHeight!==def[base[i]].h){ present.push(f); break; }
+        }
+      });
+      document.body.removeChild(span);
+    }catch(e){ return { error:M('fonts.error',function(){ throw e; }) }; }
+    var joined=present.join(',');
+    return {
+      count:M('fonts.count',function(){return present.length;}),
+      list:M('fonts.list',function(){return joined;}),
+      hash:M('fonts.hash',function(){return hash(joined);}),
+    };
+  }
+
+  /* ---- CSS media-фичи -------------------------------------------------- */
+  function cssBlock(){
+    if(!root.matchMedia) return {available:M('css.available',function(){return MSTATUS.unavailable;})};
+    var q={};
+    ['prefers-color-scheme: dark','prefers-color-scheme: light','prefers-reduced-motion: reduce',
+     'prefers-reduced-transparency: reduce','prefers-contrast: more','prefers-contrast: less',
+     'inverted-colors: inverted','forced-colors: active','dynamic-range: high','video-dynamic-range: high',
+     'any-hover: hover','any-pointer: fine','any-pointer: coarse','hover: hover','pointer: fine','pointer: coarse',
+     'color-gamut: srgb','color-gamut: p3','color-gamut: rec2020','monochrome: 0','orientation: landscape',
+     'display-mode: browser','display-mode: standalone','scripting: enabled','update: fast','overflow-block: scroll'
+    ].forEach(function(f){ q[f]=M('css['+f+']',function(){return root.matchMedia('('+f+')').matches;}); });
+    q['deviceAspect']=M('css.deviceAspect',function(){return root.matchMedia('(device-aspect-ratio: 16/9)').matches;});
+    return q;
+  }
+
+  /* ---- Math precision -------------------------------------------------- */
+  function mathBlock(){
+    // FIX (Codex P2): acos/asin are defined on [-1,1] and atanh on (-1,1), so
+    // feeding Math.PI produced NaN (a non-discriminating value). Feed each fn an
+    // IN-DOMAIN input so the low-order float bits actually fingerprint the impl.
+    var IN={acos:0.5,acosh:1.5,asin:0.5,asinh:1.5,atan:0.5,atanh:0.5,cbrt:100,cos:10,
+      cosh:10,exp:1,expm1:1,log:100,log1p:100,log10:100,sin:10,sinh:10,sqrt:100,tan:10,tanh:1};
+    var o={};
+    Object.keys(IN).sort().forEach(function(name){
+      o[name]=M('math.'+name,(function(n){ return function(){ return Math[n](IN[n]); }; })(name));
+    });
+    o['tan1e300']=M('math.tan1e300',function(){return Math.tan(-1e300);});
+    o['powPI']=M('math.powPI',function(){return Math.pow(Math.PI,-100);});
+    return o;
+  }
+
+  /* ---- кодеки ---------------------------------------------------------- */
+  function codecBlock(){
+    return S(function(){
+      var vid=typeof document!=='undefined'?document.createElement('video'):null;
+      var aud=typeof document!=='undefined'?document.createElement('audio'):null;
+      var types=['video/mp4; codecs="avc1.42E01E"','video/mp4; codecs="hev1.1.6.L93.B0"',
+        'video/webm; codecs="vp8"','video/webm; codecs="vp9"','video/mp4; codecs="av01.0.05M.08"',
+        'video/ogg; codecs="theora"','audio/mpeg','audio/mp4; codecs="mp4a.40.2"',
+        'audio/ogg; codecs="vorbis"','audio/ogg; codecs="opus"','audio/webm; codecs="opus"','audio/flac','audio/wav'];
+      var o={};
+      types.forEach(function(t){
+        var el = t.indexOf('video')===0?vid:aud;
+        // FIX (Codex P2): in workers there is no media element, so canPlayType is
+        // genuinely unavailable-in-context (a structured status, not "no-el"). The
+        // MediaSource path below works in workers and carries the signal there.
+        o['canPlay['+t+']'] = M('codecs.canPlay['+t+']', el?(function(tt){return function(){return el.canPlayType(tt);};})(t):function(){return MSTATUS.unavailable;});
+        o['mse['+t+']'] = M('codecs.mse['+t+']', (function(tt){return function(){
+          if(!(root.MediaSource&&MediaSource.isTypeSupported)) return MSTATUS.unavailable;
+          return MediaSource.isTypeSupported(tt);
+        };})(t));
+      });
+      return o;
+    });
+  }
+
+  /* ---- speechSynthesis голоса ----------------------------------------- */
+  function speechBlock(){
+    return A(function(){
+      var ss=root.speechSynthesis;
+      if(!ss||!ss.getVoices) return {available:M('speech.available',function(){return MSTATUS.unavailable;})};
+      function grab(){ return (ss.getVoices()||[]).map(function(v){return v.name+'|'+v.lang+'|'+(v.localService?'L':'R')+'|'+(v.default?'D':'');}).join(';'); }
+      function out(g){ return { voices:M('speech.voices',function(){return g;}), count:M('speech.count',function(){return g?g.split(';').length:0;}) }; }
+      var now=grab();
+      if(now) return out(now);
+      return new Promise(function(res){
+        var done=false;
+        ss.onvoiceschanged=function(){ if(done)return; done=true; res(out(grab())); };
+        setTimeout(function(){ if(done)return; done=true; res(out(grab())); },1500);
+      });
+    });
+  }
+
+  /* ---- WebRTC ---------------------------------------------------------- */
+  // WebRTC. Only STABLE, browser-intrinsic signals — codecs, header extensions,
+  // fmtp, the DTLS fingerprint algorithm, and RTP capabilities. The full SDP has
+  // per-session random ufrag/pwd/ICE, so a whole-SDP hash differs every run and
+  // is NOT a fingerprint — it used to produce false "masked" verdicts, so it's
+  // gone. Codec/capability order IS stable and is what we keep.
+  function rtcBlock(){
+    return A(function(){
+      var RP=root.RTCPeerConnection||root.webkitRTCPeerConnection;
+      if(!RP) return {status:M('webrtc.status',function(){return MSTATUS.unsupported;})};
+      // Static capabilities need no offer and carry no session randomness.
+      var caps={};
+      try{
+        var S2=root.RTCRtpSender;
+        if(S2&&S2.getCapabilities){
+          ['audio','video'].forEach(function(kind){
+            var c=S2.getCapabilities(kind)||{};
+            caps[kind+'.codecs']=M('webrtc.'+kind+'.codecs',function(){return (c.codecs||[]).map(function(x){return x.mimeType+'/'+x.clockRate+(x.sdpFmtpLine?'/'+x.sdpFmtpLine:'');}).join(',');});
+            caps[kind+'.exts']=M('webrtc.'+kind+'.exts',function(){return (c.headerExtensions||[]).map(function(x){return x.uri;}).sort().join(',');});
+          });
+        }
+      }catch(e){ caps.error='ERR:'+e.name; }
+      // codecs/fmtp/extmap set from an SDP (payload-type numbers stripped → stable)
+      function rtpmapOf(sdp){ return (sdp||'').split('\n').filter(function(l){return l.indexOf('a=rtpmap:')===0;}).map(function(l){return l.replace(/^a=rtpmap:\d+\s*/,'');}).sort(); }
+      var pc; try{ pc=new RP({iceServers:[]}); pc.createDataChannel('x'); }
+      catch(e){ return Object.assign({status:'offer-error', error:M('webrtc.offerError',function(){ throw e; })}, caps); }
+      // ICE candidates (host only — iceServers:[] → NO external STUN request).
+      // Structured decomposition (Codex v4.2 #15): type / protocol / component /
+      // address-family. The family split (mdns vs ipv4/ipv6) is the real leak
+      // signal — a candidate exposing a raw local IP (not an mDNS .local name).
+      var cands=[], types={}, protos={}, comps={}, fams={};
+      pc.onicecandidate=function(ev){ if(ev&&ev.candidate&&ev.candidate.candidate){
+        var cs=ev.candidate.candidate; cands.push(cs);
+        var parts=cs.split(/\s+/);                                  // candidate:F comp proto prio addr port typ TYPE …
+        var t=(/ typ (\w+)/.exec(cs)||[])[1]||'?'; types[t]=(types[t]||0)+1;
+        var proto=(parts[2]||'').toLowerCase(); protos[proto]=(protos[proto]||0)+1;
+        var comp=parts[1]==='1'?'rtp':parts[1]==='2'?'rtcp':(parts[1]||'?'); comps[comp]=(comps[comp]||0)+1;
+        var addr=parts[4]||''; var fam=/\.local$/i.test(addr)?'mdns':addr.indexOf(':')>=0?'ipv6':/\d+\.\d+\.\d+\.\d+/.test(addr)?'ipv4':'?'; fams[fam]=(fams[fam]||0)+1;
+      } };
+      return pc.createOffer().then(function(o){
+        var sdp=o.sdp||'';
+        return Promise.resolve(pc.setLocalDescription(o)).then(function(){
+          return new Promise(function(res2){                       // wait ICE complete / 3s
+            if(pc.iceGatheringState==='complete') return res2();
+            var t=setTimeout(res2,3000);
+            pc.addEventListener('icegatheringstatechange',function(){ if(pc.iceGatheringState==='complete'){ clearTimeout(t); res2(); } });
+          }).then(function(){ return sdp; });
+        });
+      }).then(function(sdp){
+        var lines=sdp.split('\n'), pick=function(pfx){ return lines.filter(function(l){return l.indexOf(pfx)===0;}); };
+        var rtpmap=rtpmapOf(sdp);
+        var fmtp=pick('a=fmtp:').map(function(l){return l.replace(/^a=fmtp:\d+\s*/,'');}).sort();
+        var extmap=pick('a=extmap:').map(function(l){return l.replace(/^a=extmap:\d+\s*/,'');}).sort();
+        var gatherComplete = pc.iceGatheringState==='complete';
+        // 2nd offer → codec-set stability across offers (Codex: repeated offers)
+        return Promise.resolve(pc.createOffer()).then(function(o2){ return o2.sdp||''; }, function(){ return ''; }).then(function(sdp2){
+          try{ pc.close(); }catch(_){}
+          var stable = sdp2 ? hash(rtpmap.join('|'))===hash(rtpmapOf(sdp2).join('|')) : true;
+          var cnt=function(o){return Object.keys(o).sort().map(function(k){return k+':'+o[k];}).join(',');};
+          M('webrtc.iceGatheringComplete',function(){return gatherComplete;});
+          M('webrtc.iceCandidateCount',function(){return cands.length;});
+          M('webrtc.iceCandidateTypes',function(){return cnt(types);});
+          M('webrtc.iceCandidateProtocols',function(){return cnt(protos);});
+          M('webrtc.iceCandidateComponents',function(){return cnt(comps);});
+          M('webrtc.iceCandidateFamilies',function(){return cnt(fams);});   // mdns vs ipv4/ipv6 = IP-leak signal
+          M('webrtc.offerStable',function(){return stable;});
+          return Object.assign({
+            status:'ok',
+            codecs: M('webrtc.codecs',function(){return rtpmap.join('|');}),
+            codecsHash: M('webrtc.codecsHash',function(){return hash(rtpmap.join('|'));}),
+            fmtpHash: M('webrtc.fmtpHash',function(){return hash(fmtp.join('|'));}),
+            extmap: M('webrtc.extmap',function(){return extmap.join('|');}),
+            fingerprintAlgo: M('webrtc.fingerprintAlgo',function(){ var m=sdp.match(/a=fingerprint:(\S+)/); return m?m[1]:undefined; }),
+            iceGatheringComplete:String(gatherComplete), iceCandidateCount:String(cands.length), offerStable:String(stable),
+          }, caps);
+        });
+      }, function(e){ try{ pc.close(); }catch(_){} return Object.assign({status:'offer-error', error:M('webrtc.offerError',function(){ throw e; })}, caps); });
+    });
+  }
+
+  /* ---- разное: permissions, battery, sensors, timers ------------------ */
+  function miscBlock(){
+    return A(function(){
+      var m={
+        errorStack:M('misc.errorStack',function(){ try{ null.x; }catch(e){ return e.stack?e.stack.split('\n')[0]:undefined; } }),
+        perfMemory:M('misc.perfMemory',function(){ return (root.performance&&root.performance.memory)?performance.memory.jsHeapSizeLimit:MSTATUS.unavailable; }),
+        timerRes:M('misc.timerRes',function(){ var t=[]; for(var i=0;i<300;i++) t.push(performance.now()); return new Set(t).size; }),
+        chromeObj:M('misc.chromeObj',function(){ return typeof root.chrome; }),
+        webdriver:M('misc.webdriver',function(){ return root.navigator&&root.navigator.webdriver; }),
+        notifPermission:M('misc.notifPermission',function(){ return root.Notification?Notification.permission:MSTATUS.unavailable; }),
+        pluginsLen:M('misc.pluginsLen',function(){ return (root.navigator&&root.navigator.plugins)?navigator.plugins.length:MSTATUS.unavailable; }),
+        mimeTypesLen:M('misc.mimeTypesLen',function(){ return (root.navigator&&root.navigator.mimeTypes)?navigator.mimeTypes.length:MSTATUS.unavailable; }),
+      };
+      var perms=['geolocation','notifications','camera','microphone','midi','background-sync',
+        'persistent-storage','clipboard-read','clipboard-write','accelerometer','gyroscope','magnetometer'];
+      var np=root.navigator&&root.navigator.permissions;
+      if(!np||!np.query) return m;
+      return Promise.all(perms.map(function(name){
+        return np.query({name:name}).then(function(r){ return [name,r.state]; },function(){ return [name,null]; });
+      })).then(function(rs){ rs.forEach(function(kv){
+        m['perm.'+kv[0]]=M('misc.perm.'+kv[0],(function(v){return function(){ return v==null?MSTATUS.unsupported:v; };})(kv[1]));
+      }); return m; });
+    });
+  }
+
+  /* ---- UA Client Hints (high-entropy) --------------------------------- */
+  function uachBlock(){
+    return A(function(){
+      var uad=root.navigator&&root.navigator.userAgentData;
+      if(!uad) return {available:M('uach.available',function(){return MSTATUS.unsupported;})};
+      var o={ mobile:M('uach.mobile',function(){return uad.mobile;}),
+              brands:M('uach.brands',function(){return uad.brands;}) };
+      if(!uad.getHighEntropyValues) return o;
+      return uad.getHighEntropyValues(['platform','platformVersion','architecture','bitness',
+        'model','uaFullVersion','fullVersionList','wow64','formFactor']).then(function(h){
+        Object.keys(h).sort().forEach(function(k){
+          // getHighEntropyValues ALWAYS echoes the low-entropy brands/mobile too —
+          // they're already emitted above, so skip them here or we produce a
+          // duplicate {context,path} record (Codex v4.2 #7).
+          if(k==='brands'||k==='mobile') return;
+          o[k]=M('uach.'+k,(function(v){return function(){ return v; };})(h[k]));
+        });
+        return o;
+      },function(e){ o.error=M('uach.error',function(){ throw e; }); return o; });
+    });
+  }
+
+  /* ---- native-code integrity (палит патчи антика) --------------------- */
+  function hookBlock(){
+    return S(function(){
+      var o={};
+      function sig(fn){ try{ return Function.prototype.toString.call(fn); }catch(e){ return 'ERR:'+e.name; } }
+      function native(fn){ var s=sig(fn); return /\{\s*\[native code\]\s*\}/.test(s)?'native':('PATCHED:'+s.slice(0,48)); }
+      var C=root.HTMLCanvasElement&&root.HTMLCanvasElement.prototype;
+      var targets={
+        'toString':Function.prototype.toString,
+        'bind':Function.prototype.bind,
+        'canvas.toDataURL':C&&C.toDataURL,
+        'canvas.toBlob':C&&C.toBlob,
+        'canvas.getContext':C&&C.getContext,
+        'gl.getParameter':root.WebGLRenderingContext&&root.WebGLRenderingContext.prototype.getParameter,
+        'gl.readPixels':root.WebGLRenderingContext&&root.WebGLRenderingContext.prototype.readPixels,
+        'audio.getChannelData':root.AudioBuffer&&root.AudioBuffer.prototype.getChannelData,
+        'audio.getFloatFrequencyData':root.AnalyserNode&&root.AnalyserNode.prototype.getFloatFrequencyData,
+        'perm.query':root.Permissions&&root.Permissions.prototype.query,
+        'rtc.createOffer':root.RTCPeerConnection&&root.RTCPeerConnection.prototype.createOffer,
+        'enumerateDevices':root.MediaDevices&&root.MediaDevices.prototype.enumerateDevices,
+        'getHighEntropyValues':root.NavigatorUAData&&root.NavigatorUAData.prototype.getHighEntropyValues,
+        'getContext.name':null,
+      };
+      Object.keys(targets).forEach(function(k){
+        if(k==='getContext.name') return;
+        o['native.'+k]=M('hooks.native.'+k,(function(kk){return function(){ return targets[kk]?native(targets[kk]):MSTATUS.unavailable; };})(k));
+      });
+      // patched toString often can't even describe itself as native
+      o['native.toStringOfToString']=M('hooks.native.toStringOfToString',function(){ return native(Function.prototype.toString.toString); });
+      // FIX (Codex P2): workers expose WorkerNavigator, not Navigator — the old
+      // lookup found nothing there and mislabelled every descriptor 'absent'.
+      var np=(root.Navigator&&root.Navigator.prototype)||(root.WorkerNavigator&&root.WorkerNavigator.prototype)||(root.navigator&&Object.getPrototypeOf(root.navigator))||null;
+      ['userAgent','platform','languages','hardwareConcurrency','deviceMemory','webdriver','plugins','vendor']
+        .forEach(function(p){
+          o['navDesc.'+p]=M('hooks.navDesc.'+p,(function(pp){return function(){
+            var d=null; try{ d=np&&Object.getOwnPropertyDescriptor(np,pp); }catch(e){}
+            return d ? (d.get?'getter':(d.value!==undefined?'value':'other')) : MSTATUS.unavailable;
+          };})(p));
+        });
+      o['navigator.webdriverOwnProp']=M('hooks.navigator.webdriverOwnProp',function(){ var wd=null; try{ wd=Object.getOwnPropertyDescriptor(root.navigator||{},'webdriver'); }catch(e){} return wd?'own-override':'inherited'; });
+      o['navigator.pluginsOwnProp']=M('hooks.navigator.pluginsOwnProp',function(){ var pd=null; try{ pd=Object.getOwnPropertyDescriptor(root.navigator||{},'plugins'); }catch(e){} return pd?'own-override':'inherited'; });
+      return o;
+    });
+  }
+
+  /* ---- CSS.supports матрица ------------------------------------------- */
+  function cssSupportsBlock(){
+    return S(function(){
+      if(!root.CSS||!CSS.supports) return {available:M('cssSupports.available',function(){return MSTATUS.unsupported;})};
+      var pairs=['display:grid','display:flow-root','gap:1px','aspect-ratio:1/1','backdrop-filter:blur(1px)',
+        '-webkit-backdrop-filter:blur(1px)','color:color(display-p3 1 1 1)','width:min(1px,2px)',
+        'width:clamp(1px,2px,3px)','inset:0','position:sticky','overscroll-behavior:none','scroll-snap-align:start',
+        'contain:paint','content-visibility:auto','accent-color:red','text-decoration-thickness:1px',
+        '-webkit-touch-callout:none','-moz-appearance:none','-webkit-appearance:none','font-palette:dark',
+        'container-type:inline-size','text-wrap:balance','color:lab(50 0 0)','color:oklch(0 0 0)','width:100dvh',
+        'width:100svh','width:100lvh','field-sizing:content','animation-timeline:scroll()','hyphenate-character:auto',
+        'zoom:1','-webkit-line-clamp:2','image-rendering:pixelated','mix-blend-mode:multiply','paint-order:stroke',
+        'shape-outside:circle()','offset-path:circle()','clip-path:circle()','initial-letter:2','math-style:compact',
+        'scrollbar-width:thin','scrollbar-color:red blue','text-emphasis:none','-webkit-text-security:disc'];
+      var o={};
+      pairs.forEach(function(p){
+        var i=p.indexOf(':');
+        o[p]=M('cssSupports['+p+']',function(){ return CSS.supports(p.slice(0,i),p.slice(i+1)); });
+      });
+      ['selector(:has(a))','selector(:focus-visible)','selector(:modal)','selector(::backdrop)']
+        .forEach(function(sel){ o[sel]=M('cssSupports['+sel+']',function(){ return CSS.supports(sel); }); });
+      return o;
+    });
+  }
+
+  /* ---- медиа-устройства (счётчики, без разрешений) -------------------- */
+  function mediaDevicesBlock(){
+    return A(function(){
+      var md=root.navigator&&root.navigator.mediaDevices;
+      if(!md||!md.enumerateDevices) return {available:M('mediaDevices.available',function(){return MSTATUS.unavailable;})};
+      return md.enumerateDevices().then(function(list){
+        var byKind={}, groups={};
+        list.forEach(function(d){ byKind[d.kind]=(byKind[d.kind]||0)+1; if(d.groupId) groups[d.groupId]=1; });
+        return {
+          total:M('mediaDevices.total',function(){return list.length;}),
+          audioinput:M('mediaDevices.audioinput',function(){return byKind.audioinput||0;}),
+          audiooutput:M('mediaDevices.audiooutput',function(){return byKind.audiooutput||0;}),
+          videoinput:M('mediaDevices.videoinput',function(){return byKind.videoinput||0;}),
+          groups:M('mediaDevices.groups',function(){return Object.keys(groups).length;}),
+          supportedConstraints:M('mediaDevices.supportedConstraints',function(){ return Object.keys(md.getSupportedConstraints()).sort().join(','); }),
+        };
+      },function(e){ return {error:M('mediaDevices.error',function(){ throw e; })}; });
+    });
+  }
+
+  /* ---- раскладка клавиатуры ------------------------------------------- */
+  function keyboardBlock(){
+    return A(function(){
+      var kb=root.navigator&&root.navigator.keyboard;
+      if(!kb||!kb.getLayoutMap) return {available:M('keyboard.available',function(){return MSTATUS.unavailable;})};
+      return kb.getLayoutMap().then(function(map){
+        var parts=[]; map.forEach(function(v,k){ parts.push(k+'='+v); }); parts.sort();
+        var joined=parts.join(',');
+        return { size:M('keyboard.size',function(){return parts.length;}), hash:M('keyboard.hash',function(){return hash(joined);}) };
+      },function(e){ return {error:M('keyboard.error',function(){ throw e; })}; });
+    });
+  }
+
+  /* ---- storage: квота + доступность API + partitioning-сигналы -------- */
+  function storageBlock(){
+    return A(function(){
+      var o={
+        localStorage: M('storage.localStorage',function(){ return typeof root.localStorage; }),
+        sessionStorage: M('storage.sessionStorage',function(){ return typeof root.sessionStorage; }),
+        indexedDB: M('storage.indexedDB',function(){ return typeof root.indexedDB; }),
+        caches: M('storage.caches',function(){ return typeof root.caches; }),
+        opfs: M('storage.opfs',function(){ var s=root.navigator&&root.navigator.storage; return !!(s&&s.getDirectory); }),
+        storageBuckets: M('storage.storageBuckets',function(){ return !!(root.navigator&&root.navigator.storageBuckets); }),
+      };
+      var st; try{ st=root.navigator&&root.navigator.storage; }
+      catch(e){ o.status='storage-getter-threw'; o.error=M('storage.error',function(){ throw e; }); return o; }
+      if(!st||!st.estimate){ o.status='no-estimate'; o.estimate=M('storage.estimate',function(){return MSTATUS.unavailable;}); return o; }
+      return st.estimate().then(function(e){
+        var q=e.quota||0;
+        o.status='ok'; o.quotaRoundedGB=M('storage.quotaRoundedGB',function(){return Math.round(q/1073741824);}); o.hasQuota=M('storage.hasQuota',function(){return q>0;});
+        // usageDetails buckets (partitioning-ish signal); usage itself is churn.
+        o.usageDetails=M('storage.usageDetails',function(){ return e.usageDetails?Object.keys(e.usageDetails).sort().join(','):MSTATUS.unavailable; });
+        return (st.persisted?st.persisted():Promise.resolve(null)).then(function(p){ o.persisted=M('storage.persisted',(function(pp){return function(){return pp;};})(p)); return o; }, function(){ o.persisted=M('storage.persisted',function(){return MSTATUS.unavailable;}); return o; });
+      },function(e){ o.status='estimate-error'; o.error=M('storage.error',function(){ throw e; }); return o; });
+    });
+  }
+
+  /* ---- WebAssembly feature matrix ------------------------------------- */
+  function wasmBlock(){
+    return S(function(){
+      if(typeof WebAssembly==='undefined'||!WebAssembly.validate) return {status:M('wasm.status',function(){return MSTATUS.unsupported;})};
+      // minimal modules probing proposals; validate() true/false is the signal
+      var H=function(hex){ var a=new Uint8Array(hex.length/2); for(var i=0;i<a.length;i++) a[i]=parseInt(hex.substr(i*2,2),16); return a; };
+      // Node-verified minimal modules: validate()==true where the feature exists,
+      // false where it doesn't. (Earlier hand-crafted bytes were malformed and
+      // returned a constant, detecting nothing.)
+      var mods={
+        core:       '0061736d01000000',                    // empty module
+        simd:       '0061736d010000000105016000017b',      // () -> v128
+        memory64:   '0061736d010000000503010401',          // memory, flag 0x04 (i64)
+        multiValue: '0061736d010000000106016000027f7f',    // () -> i32 i32
+        refTypes:   '0061736d010000000404016f0000'         // table externref (0x6f)
+      };
+      var o={status:'ok'};
+      Object.keys(mods).forEach(function(k){ o[k]=M('wasm.'+k,function(){ return WebAssembly.validate(H(mods[k])); }); });
+      o.streaming=M('wasm.streaming',function(){ return !!WebAssembly.instantiateStreaming; });
+      o.exceptions=M('wasm.exceptions',function(){ return typeof WebAssembly.Exception!=='undefined'; });
+      return o;
+    });
+  }
+
+  /* ---- MediaCapabilities / WebCodecs / EME (без воспроизведения) ------ */
+  function mediaCapsBlock(){
+    return A(function(){
+      var o={}, jobs=[];
+      var mc=root.navigator&&root.navigator.mediaCapabilities;
+      var vcfgs=[
+        {contentType:'video/mp4; codecs="avc1.42E01E"',width:1280,height:720,bitrate:1e6,framerate:30},
+        {contentType:'video/webm; codecs="vp9"',width:1280,height:720,bitrate:1e6,framerate:30},
+        {contentType:'video/mp4; codecs="av01.0.05M.08"',width:1280,height:720,bitrate:1e6,framerate:30}
+      ];
+      if(mc&&mc.decodingInfo){
+        vcfgs.forEach(function(cfg){
+          jobs.push(mc.decodingInfo({type:'file',video:cfg}).then(function(r){
+            o['dec['+cfg.contentType+']']=M('mediaCaps.dec['+cfg.contentType+']',function(){return [r.supported,r.smooth,r.powerEfficient].join(',');});
+          }).catch(function(e){ o['dec['+cfg.contentType+']']=M('mediaCaps.dec['+cfg.contentType+']',function(){ throw e; }); }));
+        });
+      } else o.mediaCapabilities=M('mediaCaps.mediaCapabilities',function(){return MSTATUS.unavailable;});
+      // WebCodecs
+      var VD=root.VideoDecoder;
+      if(VD&&VD.isConfigSupported){
+        [['avc1.42E01E'],['vp09.00.10.08'],['av01.0.05M.08']].forEach(function(c){
+          jobs.push(VD.isConfigSupported({codec:c[0],codedWidth:1280,codedHeight:720}).then(function(r){
+            o['webcodecs['+c[0]+']']=M('mediaCaps.webcodecs['+c[0]+']',function(){return r.supported;});
+          }).catch(function(e){ o['webcodecs['+c[0]+']']=M('mediaCaps.webcodecs['+c[0]+']',function(){ throw e; }); }));
+        });
+      } else o.webcodecs=M('mediaCaps.webcodecs',function(){return MSTATUS.unavailable;});
+      // EME — capability query only, никакого воспроизведения защищённого контента
+      var rmk=root.navigator&&root.navigator.requestMediaKeySystemAccess;
+      if(rmk){
+        var cfg=[{initDataTypes:['cenc'],videoCapabilities:[{contentType:'video/mp4;codecs="avc1.42E01E"'}]}];
+        [['com.widevine.alpha'],['com.microsoft.playready'],['org.w3.clearkey']].forEach(function(ks){
+          jobs.push(root.navigator.requestMediaKeySystemAccess(ks[0],cfg).then(function(){ o['eme['+ks[0]+']']=M('mediaCaps.eme['+ks[0]+']',function(){return true;}); },function(){ o['eme['+ks[0]+']']=M('mediaCaps.eme['+ks[0]+']',function(){return false;}); }));
+        });
+      } else o.eme=M('mediaCaps.eme',function(){return MSTATUS.unavailable;});
+      return Promise.all(jobs).then(function(){ o.status='ok'; return o; });
+    });
+  }
+
+  /* ---- оконные скаляры (девайс-пиксель и т.п.) ------------------------ */
+  function envBlock(){
+    return S(function(){
+      var o={
+        devicePixelRatio:M('env.devicePixelRatio',function(){ return root.devicePixelRatio; }),
+        maxTouchPoints:M('env.maxTouchPoints',function(){ return root.navigator&&root.navigator.maxTouchPoints; }),
+        colorDepth:M('env.colorDepth',function(){ return root.screen&&root.screen.colorDepth; }),
+        // volatile — отфильтруется в сравнении, но пусть будут в сыром дампе:
+        innerWidth:M('env.innerWidth',function(){ return root.innerWidth; }),
+        innerHeight:M('env.innerHeight',function(){ return root.innerHeight; }),
+        outerWidth:M('env.outerWidth',function(){ return root.outerWidth; }),
+        outerHeight:M('env.outerHeight',function(){ return root.outerHeight; }),
+        screenX:M('env.screenX',function(){ return root.screenX; }),
+        screenY:M('env.screenY',function(){ return root.screenY; }),
+        historyLength:M('env.historyLength',function(){ return root.history&&root.history.length; }),
+        timeOrigin:M('env.timeOrigin',function(){ return root.performance&&root.performance.timeOrigin; }),
+      };
+      var vv=root.visualViewport;
+      if(vv){ o.vvScale=M('env.vvScale',function(){ return vv.scale; }); o.vvWidth=M('env.vvWidth',function(){ return Math.round(vv.width); }); }
+      return o;
+    });
+  }
+
+  /* ---- ClientRects / DOMRect / TextMetrics / SVG geometry ------------- */
+  // Sub-pixel geometry of laid-out text: differs by engine, OS font stack, DPR
+  // and hinting. Needs a document (window/iframe); workers report unavailable.
+  function rectsBlock(){
+    return S(function(){
+      if(typeof document==='undefined' || !document.body) return {status:M('clientRects.status',function(){return MSTATUS.unavailable;})};
+      var host=document.createElement('div');
+      host.style.cssText='position:absolute;left:-9999px;top:0;font:16px/1.4 serif';
+      document.body.appendChild(host);
+      var o={};
+      try{
+        var el=document.createElement('span');
+        el.style.cssText='display:inline-block;transform:rotate(11deg) scale(1.3);padding:3px;font:italic 700 17px Arial';
+        el.textContent='Rect fjörð 😀 Wxyz'; host.appendChild(el);
+        var r=el.getBoundingClientRect();
+        o['bcr']=M('clientRects.bcr',function(){return [r.width,r.height].map(function(n){return Math.round(n*1000)/1000;}).join(',');});
+        var p=document.createElement('p'); p.style.cssText='width:120px;font:14px serif';
+        p.textContent='The quick brown fox jumps over the lazy dog, эargh ﬁne'; host.appendChild(p);
+        var rng=document.createRange(); rng.selectNodeContents(p);
+        var rects=rng.getClientRects(), acc=[];
+        for(var i=0;i<rects.length;i++){ acc.push(Math.round(rects[i].width*100)/100+'x'+Math.round(rects[i].height*100)/100); }
+        o['rangeRects']=M('clientRects.rangeRects',function(){return acc.join('|');}); o['rangeRectCount']=M('clientRects.rangeRectCount',function(){return rects.length;});
+        var cv=makeCanvas(10,10), c2=cv&&cv.getContext&&cv.getContext('2d');
+        if(c2){ c2.font='24px serif'; var tm=c2.measureText('Wjgçф免');
+          ['width','actualBoundingBoxAscent','actualBoundingBoxDescent','actualBoundingBoxLeft','actualBoundingBoxRight','fontBoundingBoxAscent','fontBoundingBoxDescent','emHeightAscent','emHeightDescent','hangingBaseline','alphabeticBaseline','ideographicBaseline'].forEach(function(k){ o['tm.'+k]=M('clientRects.tm.'+k,function(){ return tm[k]!==undefined?Math.round(tm[k]*1000)/1000:undefined; }); }); }
+        if(document.createElementNS){
+          var ns='http://www.w3.org/2000/svg', svg=document.createElementNS(ns,'svg');
+          svg.setAttribute('width','120'); svg.setAttribute('height','40'); host.appendChild(svg);
+          var t=document.createElementNS(ns,'text'); t.setAttribute('font-family','serif'); t.setAttribute('font-size','16');
+          t.textContent='SVG mëtríc 😀'; svg.appendChild(t);
+          o['svgBBox']=M('clientRects.svgBBox',function(){ var bb=t.getBBox(); return [bb.width,bb.height].map(function(n){return Math.round(n*1000)/1000;}).join(','); });
+          o['svgTextLen']=M('clientRects.svgTextLen',function(){ return Math.round(t.getComputedTextLength()*1000)/1000; });
+        }
+      }catch(e){ o.error=M('clientRects.error',function(){ throw e; }); }
+      finally{ try{ document.body.removeChild(host); }catch(_){} }
+      o.status='ok'; return o;
+    });
+  }
+
+  /* ---- device APIs (без prompt): battery, gamepads ------------------- */
+  function deviceBlock(){
+    return A(function(){
+      var o={};
+      o.gamepads=M('device.gamepads',function(){ var g=root.navigator&&root.navigator.getGamepads?root.navigator.getGamepads():null; return g?Array.prototype.filter.call(g,Boolean).length:MSTATUS.unavailable; });
+      o.hasBluetooth=M('device.hasBluetooth',function(){ return !!(root.navigator&&root.navigator.bluetooth); });
+      o.hasUSB=M('device.hasUSB',function(){ return !!(root.navigator&&root.navigator.usb); });
+      o.hasHID=M('device.hasHID',function(){ return !!(root.navigator&&root.navigator.hid); });
+      o.hasSerial=M('device.hasSerial',function(){ return !!(root.navigator&&root.navigator.serial); });
+      var gb=root.navigator&&root.navigator.getBattery;
+      if(!gb) { o.battery=M('device.battery',function(){return MSTATUS.unavailable;}); return o; }
+      var bp; try{ bp=root.navigator.getBattery(); }catch(e){ o.battery=M('device.battery',function(){ throw e; }); return o; }
+      if(!bp||typeof bp.then!=='function'){ o.battery=M('device.battery',function(){return MSTATUS.invalid;}); return o; }
+      return bp.then(function(b){
+        // charging + rounded level; raw level/times are churn (volatile-tagged).
+        o.batteryCharging=M('device.batteryCharging',function(){return b.charging;});
+        o.batteryLevel=M('device.batteryLevel',function(){return Math.round((b.level||0)*10)/10;}); // coarse; tagged volatile
+        o.batteryChargingTimeFinite=M('device.batteryChargingTimeFinite',function(){return isFinite(b.chargingTime);});
+        return o;
+      },function(){ o.battery=M('device.battery',function(){return MSTATUS.unavailable;}); return o; });
+    });
+  }
+
+  /* ---- Intl (фиксированные входы, реальные выходы) -------------------- */
+  function intlExtraBlock(){
+    return S(function(){
+      if(typeof Intl==='undefined') return {status:M('intlx.status',function(){return MSTATUS.unavailable;})};
+      var o={status:'ok'};
+      o.tzCount=M('intlx.tzCount',function(){ return Intl.supportedValuesOf?Intl.supportedValuesOf('timeZone').length:MSTATUS.unsupported; });
+      o.calendars=M('intlx.calendars',function(){ return Intl.supportedValuesOf?Intl.supportedValuesOf('calendar').slice(0,12).join(','):MSTATUS.unsupported; });
+      o.currencyCount=M('intlx.currencyCount',function(){ return Intl.supportedValuesOf?Intl.supportedValuesOf('currency').length:MSTATUS.unsupported; });
+      o.dtfParts=M('intlx.dtfParts',function(){ var f=new Intl.DateTimeFormat('en-US',{dateStyle:'full',timeStyle:'full',timeZone:'UTC'}); return f.formatToParts(new Date(0)).map(function(p){return p.type+':'+p.value;}).join('|'); });
+      o.nfParts=M('intlx.nfParts',function(){ return new Intl.NumberFormat('de-DE',{style:'currency',currency:'EUR'}).formatToParts(-1234.5).map(function(p){return p.type;}).join(','); });
+      o.displayRegion=M('intlx.displayRegion',function(){ return Intl.DisplayNames?new Intl.DisplayNames(['en'],{type:'region'}).of('UA'):MSTATUS.unsupported; });
+      o.displayLang=M('intlx.displayLang',function(){ return Intl.DisplayNames?new Intl.DisplayNames(['en'],{type:'language'}).of('uk'):MSTATUS.unsupported; });
+      o.segmenter=M('intlx.segmenter',function(){ if(!Intl.Segmenter) return MSTATUS.unsupported; var s=new Intl.Segmenter('ja',{granularity:'word'}); return Array.from(s.segment('こんにちは世界')).length; });
+      return o;
+    });
+  }
+
+  /* ---- Error.stack нескольких видов (нормализуем blob/line:col) ------- */
+  function errorBlock(){
+    return A(function(){
+      // FIX (Codex P2): keep REAL stack frames as a structured array — one entry
+      // per frame — instead of collapsing to one string. Only the volatile URL/
+      // blob host is normalised; the :line:col and frame format stay (they are
+      // exactly what distinguishes V8 / SpiderMonkey / JSC).
+      var frames=function(stack){
+        return (stack||'').split('\n').map(function(l){return l.trim();}).filter(Boolean)
+          .map(function(l){ return l.replace(/blob:https?:\/\/[^\s):]+/g,'blob:').replace(/https?:\/\/[^\/\s):]+/g,'origin'); });
+      };
+      var o={};
+      o.syncFrames=M('errors.syncFrames',function(){ try{ throw new Error('x'); }catch(e){ return frames(e.stack); } });
+      o.typeErrorFrames=M('errors.typeErrorFrames',function(){ try{ (null).x; }catch(e){ return frames(e.stack); } });
+      o.nestedFrames=M('errors.nestedFrames',function(){ function a(){ b(); } function b(){ throw new Error('n'); } try{ a(); }catch(e){ return frames(e.stack); } });
+      o.domException=M('errors.domException',function(){ try{ if(typeof DOMException!=='undefined') throw new DOMException('d','NotAllowedError'); throw new Error('nodom'); }catch(e){ return {name:e.name,frames:frames(e.stack)}; } });
+      o.evalFrames=M('errors.evalFrames',function(){ try{ (0,eval)('throw new Error("ev")'); }catch(e){ return frames(e.stack); } });
+      o.prepareStackTrace=M('errors.prepareStackTrace',function(){ return typeof Error.prepareStackTrace; });
+      o.stackTraceLimit=M('errors.stackTraceLimit',function(){ return Error.stackTraceLimit; });
+      return Promise.resolve().then(function(){
+        o.asyncFrames=M('errors.asyncFrames',function(){ try{ throw new Error('async'); }catch(e){ return frames(e.stack); } });
+        return o;
+      });
+    });
+  }
+
+  /* ---- независимый контроль: ThumbmarkJS (MIT) ----------------------- */
+  // Second, independently-implemented fingerprint set as a CONTROL (Codex §7).
+  // Needs a document (main-frame/iframe); its raw components go under control.*
+  // and never feed our verdicts. Loaded on demand, graceful on any failure.
+  // Independent CONTROL engines (Codex v4 §Control): several self-hosted, pinned
+  // MIT fingerprint sets whose RAW components go under control.* and never feed
+  // our verdicts. All telemetry OFF — Thumbmark logging:false, FingerprintJS
+  // monitoring:false — so a control engine makes ZERO external requests.
+  function controlBlock(){
+    return A(function(){
+      if(typeof document==='undefined'||!document.head) return {status:'unavailable-in-context'};
+      function loadScript(url){
+        return new Promise(function(res){
+          var s=document.createElement('script'); s.src=url;
+          s.onerror=function(){ res(false); }; s.onload=function(){ res(true); };
+          try{ document.head.appendChild(s); }catch(e){ res(false); }
+          setTimeout(function(){ res(false); },12000);
+        });
+      }
+      // Per-engine typed MANIFEST (Codex v4.3 #5): engine/version/status/duration/
+      // componentCount/errorCount/hash — emitted as one typed record so the server
+      // can grade controlStatus rigorously (not just "prefix present").
+      function engineManifest(ns, o){ M('control.'+ns+'.__manifest', function(){ return o; }); return o; }
+      function ctrlHash(x){ try{ return sha256hex(JSON.stringify(x)); }catch(e){ return null; } }
+
+      function runThumbmark(){
+        return loadScript('/fingerprint/control?engine=thumbmark').then(function(okL){
+          if(!okL) return engineManifest('thumbmark',{engine:'thumbmarkjs',version:'1.11.0',status:'load-error',componentCount:0,errorCount:1});
+          var T=root.ThumbmarkJS;
+          if(!T||typeof T.getFingerprint!=='function') return engineManifest('thumbmark',{engine:'thumbmarkjs',version:'1.11.0',status:'no-api',componentCount:0,errorCount:1});
+          try{ if(T.setOption) T.setOption('logging',false); }catch(e){} // no sampled logging
+          var t0=nowMs();
+          // ONE run: getFingerprintData() yields components AND (often) the hash.
+          return Promise.resolve(T.getFingerprintData?T.getFingerprintData():null).then(function(data){
+            var comps=(data&&data.components)?data.components:(data&&typeof data==='object'&&!('hash' in data)?data:(data&&data.data)||{});
+            var hash=(data&&data.hash)?String(data.hash):ctrlHash(comps);
+            var ks=[]; try{ ks=Object.keys(comps||{}); }catch(e){}
+            var errs=0; ks.forEach(function(k){ M('control.thumbmark.'+k,(function(vv){return function(){return vv;};})(comps[k])); });
+            M('control.thumbmark.hash',function(){return hash;});
+            return engineManifest('thumbmark',{engine:'thumbmarkjs',version:'1.11.0',status:'ok',durationMs:+(nowMs()-t0).toFixed(1),componentCount:ks.length,errorCount:errs,hash:hash});
+          },function(e){ return engineManifest('thumbmark',{engine:'thumbmarkjs',version:'1.11.0',status:'error',error:'ERR:'+(e&&e.name),componentCount:0,errorCount:1}); });
+        });
+      }
+      function runFingerprintjs(){
+        return loadScript('/fingerprint/control?engine=fingerprintjs').then(function(okL){
+          if(!okL) return engineManifest('fingerprintjs',{engine:'fingerprintjs',version:'5.0.0',status:'load-error',componentCount:0,errorCount:1});
+          var F=root.FingerprintJS;
+          if(!F||typeof F.load!=='function') return engineManifest('fingerprintjs',{engine:'fingerprintjs',version:'5.0.0',status:'no-api',componentCount:0,errorCount:1});
+          var t0=nowMs();
+          return Promise.resolve(F.load({monitoring:false})).then(function(fp){ return fp.get(); }).then(function(r){
+            // Emit FULL typed components (value + duration + error) as records.
+            var comps=r.components||{}, ks=[], errs=0; try{ ks=Object.keys(comps); }catch(e){}
+            ks.forEach(function(k){ var c=comps[k]; if(c&&c.error)errs++;
+              M('control.fingerprintjs.'+k,(function(cc){return function(){return {value:(cc&&'value' in cc)?cc.value:null,duration:cc&&cc.duration,error:cc&&cc.error?String(cc.error):null};};})(c)); });
+            M('control.fingerprintjs.visitorId',function(){return String(r.visitorId);});
+            return engineManifest('fingerprintjs',{engine:'fingerprintjs',version:String(r.version||'5.0.0'),status:'ok',durationMs:+(nowMs()-t0).toFixed(1),componentCount:ks.length,errorCount:errs,hash:String(r.visitorId)});
+          },function(e){ return engineManifest('fingerprintjs',{engine:'fingerprintjs',version:'5.0.0',status:'error',error:'ERR:'+(e&&e.name),componentCount:0,errorCount:1}); });
+        });
+      }
+      // SANITY headless checks — our own small bot/headless set, kept as a basic
+      // SANITY check (NOT counted as an engine). Namespace control.sanity.headless.*
+      // The REAL FPScanner engine (vendored) is runFpscanner() below (Codex v4.2 #13).
+      function runSanityHeadless(){
+        var c={};
+        c.webdriver=M('control.sanity.headless.webdriver',function(){ return !!(root.navigator&&root.navigator.webdriver); });
+        c.headlessUA=M('control.sanity.headless.headlessUA',function(){ return /headless/i.test((root.navigator&&root.navigator.userAgent)||''); });
+        c.chromeObject=M('control.sanity.headless.chromeObject',function(){ return typeof root.chrome; });
+        c.chromeRuntime=M('control.sanity.headless.chromeRuntime',function(){ return !!(root.chrome&&root.chrome.runtime); });
+        c.pluginsZero=M('control.sanity.headless.pluginsZero',function(){ return !!(root.navigator&&root.navigator.plugins&&root.navigator.plugins.length===0); });
+        c.languagesEmpty=M('control.sanity.headless.languagesEmpty',function(){ var l=root.navigator&&root.navigator.languages; return !l||l.length===0; });
+        c.notificationVsPermission=M('control.sanity.headless.notifVsPerm',function(){
+          // classic headless tell: Notification.permission 'denied' while default should be 'default'
+          return root.Notification?Notification.permission:MSTATUS.unavailable;
+        });
+        c.appVersionInUA=M('control.sanity.headless.appVersionInUA',function(){ var a=navigator.appVersion||'',u=navigator.userAgent||''; return u.indexOf(a)>=0; });
+        return Promise.resolve({ status:'ok', engine:'sanity-headless', version:'sanity-1', checks:c });
+      }
+      // CONSISTENCY / lie checks — our own small set, kept as a basic SANITY
+      // check (NOT counted as an engine). Namespace control.sanity.consistency.*
+      function runSanityConsistency(){
+        var c={};
+        c.uaPlatformMatch=M('control.sanity.consistency.uaPlatformMatch',function(){
+          var ua=navigator.userAgent||'', p=navigator.platform||'';
+          if(/Win/.test(p)) return /Windows/.test(ua);
+          if(/Mac/.test(p)) return /Mac OS/.test(ua);
+          if(/Linux|X11/.test(p)) return /Linux|X11|Android/.test(ua);
+          return MSTATUS.unsupported;
+        });
+        c.toStringNative=M('control.sanity.consistency.toStringNative',function(){ return /\[native code\]/.test(Function.prototype.toString.toString()); });
+        c.languagesVsLanguage=M('control.sanity.consistency.languagesVsLanguage',function(){ var ls=navigator.languages; return !!(ls&&ls.length&&ls[0]===navigator.language); });
+        c.hardwareConcurrency=M('control.sanity.consistency.hardwareConcurrency',function(){ return navigator.hardwareConcurrency; });
+        c.deviceMemory=M('control.sanity.consistency.deviceMemory',function(){ return navigator.deviceMemory; });
+        c.productSub=M('control.sanity.consistency.productSub',function(){ return navigator.productSub; }); // 20030107 on real Chrome/Safari
+        c.vendorMatch=M('control.sanity.consistency.vendorMatch',function(){ return navigator.vendor; }); // "Google Inc." on Chrome
+        return Promise.resolve({ status:'ok', engine:'sanity-consistency', version:'sanity-1', checks:c });
+      }
+      // REAL FPScanner engine (Codex v4.2 #13): vendored fp-collect + fpscanner
+      // (MIT, antoinevastel), bundled to an IIFE (ua-parser-js inlined). Runs the
+      // genuine collector + analyser; raw signals + per-test verdicts under
+      // control.fpscanner.*
+      function runFpscanner(){
+        return loadScript('/fingerprint/control?engine=fpscanner').then(function(okL){
+          if(!okL) return engineManifest('fpscanner',{engine:'fpscanner',version:'0.1.5+fpcollect1.0.5',status:'load-error',componentCount:0,errorCount:1});
+          var C=root.fpCollect, S2=root.fpScanner;
+          if(!C||!C.generateFingerprint||!S2||!S2.analyseFingerprint) return engineManifest('fpscanner',{engine:'fpscanner',version:'0.1.5+fpcollect1.0.5',status:'no-api',componentCount:0,errorCount:1});
+          var t0=nowMs();
+          return Promise.resolve(C.generateFingerprint()).then(function(fp){
+            var analysis; try{ analysis=S2.analyseFingerprint(fp); }catch(e){ analysis=null; }
+            // Full RAW signals, LOSSLESS (encodeValue handles nested objects — no slice).
+            var ks=[]; try{ ks=Object.keys(fp||{}); }catch(e){}
+            ks.forEach(function(k){ M('control.fpscanner.'+k,(function(vv){return function(){return vv;};})(fp[k])); });
+            // FPScanner consistent enum: 1=INCONSISTENT, 2=UNSURE, 3=CONSISTENT
+            // (Codex v4.3 #4). Keep each test's RAW consistent + data.
+            var VERD={1:'INCONSISTENT',2:'UNSURE',3:'CONSISTENT'};
+            var testKeys=[], inconsistent=0;
+            try{ testKeys=analysis?Object.keys(analysis):[]; }catch(e){}
+            testKeys.forEach(function(k){ var a=analysis[k]||{}; var verdict=VERD[a.consistent]||('raw:'+a.consistent);
+              if(a.consistent===1) inconsistent++;
+              M('control.fpscanner.test.'+k,(function(aa,vd){return function(){return {consistent:aa.consistent,verdict:vd,data:aa.data};};})(a,verdict)); });
+            return engineManifest('fpscanner',{engine:'fpscanner',version:'0.1.5+fpcollect1.0.5',status:'ok',durationMs:+(nowMs()-t0).toFixed(1),componentCount:ks.length,testCount:testKeys.length,inconsistentCount:inconsistent,errorCount:0,hash:ctrlHash(fp)});
+          },function(e){ return engineManifest('fpscanner',{engine:'fpscanner',version:'0.1.5+fpcollect1.0.5',status:'error',error:'ERR:'+(e&&e.name),componentCount:0,errorCount:1}); });
+        });
+      }
+      // REAL ClientJS engine (Codex v4.2 #13): vendored ClientJS 0.2.1 (Apache-2.0,
+      // jackspirou), drop-in window.ClientJS. Full component getters under
+      // control.clientjs.*
+      function runClientjs(){
+        return loadScript('/fingerprint/control?engine=clientjs').then(function(okL){
+          if(!okL) return engineManifest('clientjs',{engine:'clientjs',version:'0.2.1',status:'load-error',componentCount:0,errorCount:1});
+          var CJ=root.ClientJS;
+          if(!CJ) return engineManifest('clientjs',{engine:'clientjs',version:'0.2.1',status:'no-api',componentCount:0,errorCount:1});
+          var t0=nowMs();
+          try{
+            var c=new CJ();
+            var getters=['getFingerprint','getUserAgent','getBrowser','getBrowserVersion','getOS','getOSVersion','getDevice','getCPU','getEngine','getScreenPrint','getColorDepth','getCurrentResolution','getAvailableResolution','getTimeZone','getLanguage','getSystemLanguage','getCanvasPrint','getPlugins','getFonts'];
+            var comps={}, errs=0;
+            getters.forEach(function(g){ try{ var v=c[g]?c[g]():undefined; comps[g]=v; M('control.clientjs.'+g,(function(vv){return function(){return vv;};})(v)); }catch(e){ errs++; M('control.clientjs.'+g,function(){ throw e; }); } });
+            return engineManifest('clientjs',{engine:'clientjs',version:'0.2.1',status:'ok',durationMs:+(nowMs()-t0).toFixed(1),componentCount:getters.length-errs,errorCount:errs,hash:ctrlHash(comps)});
+          }catch(e){ return engineManifest('clientjs',{engine:'clientjs',version:'0.2.1',status:'error',error:'ERR:'+(e&&e.name),componentCount:0,errorCount:1}); }
+        });
+      }
+      // 4 REAL engines (thumbmark · fingerprintjs · fpscanner · clientjs) + 2
+      // demoted SANITY checks (NOT engines). Codex v4.2 #13.
+      return Promise.all([runThumbmark(),runFingerprintjs(),runFpscanner(),runClientjs(),runSanityHeadless(),runSanityConsistency()]).then(function(r){
+        return { thumbmark:r[0], fingerprintjs:r[1], fpscanner:r[2], clientjs:r[3], sanityHeadless:r[4], sanityConsistency:r[5] };
+      });
+    });
+  }
+
+  /* ---- сборка одного контекста ---------------------------------------- */
+  function collect(contextName){
+    var t0=(root.performance||Date).now();
+    var meas=[];
+    CUR.context=contextName; CUR.phase='passive'; CUR.recs=meas;
+    return Promise.resolve().then(function(){
+      var base={ _context:contextName };
+      Object.assign(base, deepBlock());
+      var jobs=[
+        ['locale',   Promise.resolve(localeBlock())],
+        ['canvas',   Promise.resolve(canvasBlock())],
+        ['webgl',    Promise.resolve(glBlock())],
+        ['webgpu',   gpuBlock()],
+        ['audio',    audioBlock()],
+        ['fonts',    Promise.resolve(fontBlock())],
+        ['css',      Promise.resolve(cssBlock())],
+        ['math',     Promise.resolve(mathBlock())],
+        ['codecs',   Promise.resolve(codecBlock())],
+        ['speech',   speechBlock()],
+        ['webrtc',   rtcBlock()],
+        ['misc',     miscBlock()],
+        ['uach',     uachBlock()],
+        ['hooks',    Promise.resolve(hookBlock())],
+        ['cssSupports', Promise.resolve(cssSupportsBlock())],
+        ['mediaDevices', mediaDevicesBlock()],
+        ['keyboard', keyboardBlock()],
+        ['storage',  storageBlock()],
+        ['env',      Promise.resolve(envBlock())],
+        ['clientRects', Promise.resolve(rectsBlock())],
+        ['wasm',     Promise.resolve(wasmBlock())],
+        ['mediaCaps', mediaCapsBlock()],
+        ['device',   deviceBlock()],
+        ['intlx',    Promise.resolve(intlExtraBlock())],
+        ['errors',   errorBlock()],
+        // Control engines load external scripts (Thumbmark/FingerprintJS) — that
+        // belongs ONLY in the main document. Running it in every worker/iframe/
+        // OOPIF added ~24s each and blew their harness timeouts. Main-frame only.
+        ['control',  contextName==='main-frame' ? controlBlock() : Promise.resolve({status:'skipped-non-main'})],
+      ];
+      // Per-job timeout: NO single block may hang the whole realm. A block that
+      // never settles (e.g. a policy-gated async API in a subframe) is bounded to
+      // 'ERR:job-timeout' so Promise.all — and thus collect() — always resolves
+      // and the realm always posts its snapshot back. control is main-frame-only
+      // and can legitimately spend longer loading engines, so it gets a wide cap.
+      function jobGuard(name,p,cap){ return new Promise(function(resolve){ var settled=false;
+        var to=setTimeout(function(){ if(!settled){ settled=true;
+          // Codex v4.2 #6: a timed-out job leaves a TYPED record (status=timeout),
+          // not only the legacy 'ERR:job-timeout' sentinel, so the manifest and
+          // validator see a real terminal status for the block.
+          try{ meas.push({path:name+'.__job',context:contextName,phase:'passive',status:STATUS.timeout,valueType:null,value:null,error:{name:'JobTimeout',message:'job exceeded '+cap+'ms'},meta:{durationMs:cap}}); }catch(_){}
+          resolve('ERR:job-timeout'); } },cap);
+        Promise.resolve(p).then(function(v){ if(!settled){ settled=true; clearTimeout(to); resolve(v); } },
+          function(e){ if(!settled){ settled=true; clearTimeout(to); resolve('ERR:'+(e&&e.name)); } }); }); }
+      return Promise.all(jobs.map(function(j){ var cap=j[0]==='control'?60000:(j[0]==='webgpu'?20000:12000); return jobGuard(j[0], j[1], cap).then(function(v){ return [j[0],v]; }); }))
+        .then(function(parts){
+          parts.forEach(function(kv){
+            var v=kv[1];
+            // A block that resolved to a bare primitive (e.g. 'ERR:Name' from a
+            // thrown block, or 'undef') must leave a breadcrumb — walk() on a
+            // string returns {} and the whole block would vanish silently,
+            // making an errored context look like one that never ran.
+            if(v===null || typeof v!=='object'){ base[kv[0]]=v; }
+            else Object.assign(base, walk(v, kv[0], 5));
+          });
+          // TYPED source of truth (Codex v4): `meas` already holds every block
+          // probe's typed record (pushed by M()/MA() during Promise.all). Append
+          // the deep object graph (navigator/screen/window/document) with native
+          // types preserved. Legacy string map above stays for compat.
+          try{
+            if(root.navigator) walkTyped(root.navigator,'navigator',contextName,'passive',meas);
+            if(root.screen) walkTyped(root.screen,'screen',contextName,'passive',meas);
+            walkTyped({globals:(function(){try{return Object.getOwnPropertyNames(root).sort().join(',');}catch(e){return null;}})()},'window',contextName,'passive',meas,1);
+            if(typeof document!=='undefined'&&document){
+              ['characterSet','compatMode','referrer','visibilityState'].forEach(function(k){
+                var v,er=null; try{v=document[k];}catch(e){er={name:e.name,message:e.message};}
+                var enc=er?null:encodeValue(v);
+                meas.push({path:'document.'+k,context:contextName,phase:'passive',
+                  status:er?STATUS.error:STATUS.ok,valueType:enc?enc.valueType:null,
+                  value:enc?enc.value:null,error:er,meta:{}});
+              });
+            }
+            base._measurements=meas;
+            base._schema='typed-v4-partial'; // deep-walk + migrated blocks typed
+          }catch(e){ base._measurementsError='ERR:'+(e&&e.name); }
+          CUR.recs=null;
+          base._collectMs=Math.round(((root.performance||Date).now())-t0);
+          return base;
+        });
+    });
+  }
+
+  root.LinkageProbe={ collect:collect, hash:hash, walk:walk, walkTyped:walkTyped, encodeValue:encodeValue, version:4 };
+}
+COLLECTOR(typeof self!=='undefined'?self:this);
+
+/* ---- харнесс: воркеры, worklet, отправка (без дублирования кода) ------ */
+var COLLECTOR_SRC='('+COLLECTOR.toString()+')(self);';
+var WORKER_SRC="self.onmessage=async()=>{var m=await self.LinkageProbe.collect('__KIND__');self.postMessage(m);};"
+  +"self.onconnect=(e)=>{var p=e.ports[0];p.start();p.onmessage=async()=>p.postMessage(await self.LinkageProbe.collect('__KIND__'));};";
+
+// audio-worklet: trimmed realm (no fetch/importScripts, and NO navigator). We
+// must not blindly reference navigator (that threw ReferenceError -> ERR:*);
+// missing APIs report 'unavailable-in-context'. Only genuinely-available worklet
+// globals (sampleRate/currentTime/currentFrame) plus Intl/Math are measured.
+var WORKLET_SRC="class Probe extends AudioWorkletProcessor{constructor(){super();this.port.onmessage=()=>{"
+  +"var S=(f)=>{try{var v=f();return v===undefined?'undef':v;}catch(e){return 'ERR:'+e.name;}};"
+  +"var NAV=(g)=>S(()=>typeof navigator==='undefined'?'unavailable-in-context':g());"
+  +"var H=(s)=>{var h=2166136261;for(var i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619);}return (h>>>0).toString(16);};"
+  // DSP-result: a deterministic nonlinear signal computed IN the worklet realm —
+  // exercises this realm's float math (Codex P2/P3: AudioWorklet DSP output).
+  +"var dsp=(function(){var acc=0,out=[];for(var i=0;i<256;i++){var x=Math.sin(i*0.19)+Math.tanh(i*0.017)*0.5+Math.cbrt(i+1)*0.001;acc+=Math.abs(x);out.push(Math.round(x*1e6)/1e6);}return {sum:acc,hash:H(out.join(',')),len:out.length};})();"
+  +"this.port.postMessage({_context:'audio-worklet',"
+  +"'navigator.userAgent':NAV(()=>navigator.userAgent),'navigator.platform':NAV(()=>navigator.platform),"
+  +"'navigator.hardwareConcurrency':NAV(()=>navigator.hardwareConcurrency),'navigator.deviceMemory':NAV(()=>navigator.deviceMemory),"
+  +"'locale.tz':S(()=>typeof Intl==='undefined'?'unavailable-in-context':Intl.DateTimeFormat().resolvedOptions().timeZone),"
+  +"'locale.locale':S(()=>typeof Intl==='undefined'?'unavailable-in-context':Intl.DateTimeFormat().resolvedOptions().locale),"
+  +"'math.tanPI':S(()=>Math.tan(Math.PI)),'math.sinh1':S(()=>Math.sinh(1)),"
+  +"'worklet.sampleRate':S(()=>typeof sampleRate!=='undefined'?sampleRate:'undef'),"
+  +"'worklet.currentTime':S(()=>typeof currentTime!=='undefined'?currentTime:'undef'),"
+  +"'worklet.currentFrame':S(()=>typeof currentFrame!=='undefined'?currentFrame:'undef'),"
+  // structured signal instead of the bare string 'undefined' (Codex P2)
+  +"'worklet.hasNavigator':S(()=>typeof navigator==='undefined'?'unavailable-in-context':'present'),"
+  +"'worklet.dsp.sum':dsp.sum,'worklet.dsp.hash':dsp.hash,'worklet.dsp.len':dsp.len,"
+  +"'worklet.globals':S(()=>Object.getOwnPropertyNames(globalThis).sort().join(','))});};}process(){return true;}}"
+  +"registerProcessor('probe',Probe);";
+
+var COLLECT_URL=new URLSearchParams(location.search).get('collect')||'/collect';
+var logEl=document.getElementById('log');
+function log(s,c){ var d=document.createElement('div'); if(c)d.className=c; d.textContent=s; logEl.append(d); }
+
+// Terminal-manifest bookkeeping (Codex v4.2 #5): every server ACK and every
+// realm's terminal status, so "готово" is only declared once the server has
+// acknowledged a COMPLETE run — not on the first line landing.
+var SENDLOG=[];        // {context, ok, status} — one per send() attempt
+var REALM_STATUS={};   // realm -> {status:'finished'|'timeout'|'unsupported'|'blocked'|'error', detail}
+function rstat(name,status,detail){ if(!REALM_STATUS[name]||REALM_STATUS[name].status!=='finished') REALM_STATUS[name]={status:status,detail:detail||null}; }
+
+// send() MUST reject on HTTP non-2xx AND on network failure (Codex v4.2 #5): a
+// silently-swallowed failure was how a half-saved run looked "done". Callers that
+// must not hang still use .then(res,res); the failure is recorded in SENDLOG.
+function send(context,m){
+  return fetch(COLLECT_URL,{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({context:context,m:m})}).then(function(r){
+      SENDLOG.push({context:context,ok:r.ok,status:r.status});
+      if(!r.ok){ log('  ✗ '+context+' '+r.status,'err'); throw new Error('http-'+r.status); }
+      log('  ✓ '+context+' ('+Object.keys(m).length+' параметров)','ok');
+      return r;
+    },function(e){
+      SENDLOG.push({context:context,ok:false,status:0,error:String(e&&e.message||e)});
+      log('  ✗ '+context+': '+(e&&e.message||e),'err');
+      throw e;
+    });
+}
+function blobURL(src){ return URL.createObjectURL(new Blob([src],{type:'text/javascript'})); }
+
+// The audio-worklet realm posts a flat map (it can't run the M() pipeline). Type
+// it on the main thread, classifying the worklet's sentinels into real statuses.
+function typifyWorklet(m, context){
+  var recs=[], enc=(self.LinkageProbe&&self.LinkageProbe.encodeValue)||null;
+  Object.keys(m).forEach(function(k){
+    if(k==='_context'||k==='_measurements'||k==='_schema') return;
+    var v=m[k], status='ok', err=null, ev={valueType:'string',value:v};
+    if(v==='unavailable-in-context'){ status='unavailable-in-context'; ev={valueType:'null',value:null}; }
+    else if(v==='undef'){ ev={valueType:'undefined',value:null}; }
+    else if(typeof v==='string' && v.indexOf('ERR:')===0){ status='error'; err={name:v.slice(4),message:''}; ev={valueType:null,value:null}; }
+    else if(enc){ ev=enc(v); }
+    var meta={}; if(ev.special)meta.special=ev.special; if(ev.count!=null)meta.count=ev.count;
+    recs.push({path:k,context:context,phase:'passive',status:status,valueType:ev.valueType,value:ev.value,error:err,meta:meta});
+  });
+  return recs;
+}
+
+// kind: dedicated-worker | shared-worker (+ '-module' variants). Module workers
+// are a distinct realm (module scope) worth capturing separately (Codex P4).
+function viaWorker(kind){
+  var shared = kind.indexOf('shared')===0;
+  var module = /-module$/.test(kind);
+  return new Promise(function(res){
+    var t=setTimeout(function(){ rstat(kind,'timeout'); log('  ! '+kind+' timeout','err'); res(); },20000);
+    try{
+      var url=blobURL(COLLECTOR_SRC+'\n'+WORKER_SRC.replace(/__KIND__/g,kind));
+      var opts = module ? {type:'module'} : undefined;
+      var w = shared?new SharedWorker(url,opts):new Worker(url,opts);
+      var port = shared?(w.port.start(),w.port):w;
+      port.onmessage=function(e){ clearTimeout(t); if(w.terminate)w.terminate(); send(kind,e.data).then(function(){rstat(kind,'finished');res();},function(){rstat(kind,'error','send');res();}); };
+      port.postMessage('go');
+    }catch(e){ clearTimeout(t); rstat(kind,'error',e.message); log('  ! '+kind+': '+e.message,'err'); res(); }
+  });
+}
+function viaWorklet(){
+  return (async function(){
+    try{
+      // OfflineAudioContext, NOT a realtime AudioContext: a realtime context
+      // opened without a user gesture stays 'suspended' (autoplay policy), its
+      // render loop never runs, the processor is never constructed and 'go' is
+      // never serviced — the worklet realm was silently lost to a 12s timeout.
+      // Offline rendering runs deterministically with no gesture requirement.
+      var OAC=window.OfflineAudioContext||window.webkitOfflineAudioContext;
+      if(!OAC){ rstat('audio-worklet','unsupported','no OfflineAudioContext'); log('  ! audio-worklet: no OfflineAudioContext','err'); return; }
+      var ac=new OAC(1,128,44100);
+      await ac.audioWorklet.addModule(blobURL(WORKLET_SRC));
+      var n=new AudioWorkletNode(ac,'probe');
+      n.connect(ac.destination);
+      var m=await new Promise(function(res,rej){
+        n.port.onmessage=function(e){res(e.data);};
+        n.port.postMessage('go');
+        ac.startRendering();               // drives the quantum → processor runs
+        setTimeout(function(){rej(new Error('timeout'));},12000);
+      });
+      try{ m._measurements=typifyWorklet(m,'audio-worklet'); m._schema='typed-v4-partial'; }catch(_){}
+      await send('audio-worklet',m); rstat('audio-worklet','finished');
+    }catch(e){ rstat('audio-worklet', e&&e.message==='timeout'?'timeout':'error', e&&e.message); log('  ! audio-worklet: '+e.message,'err'); }
+  })();
+}
+
+// iframe — тот же сбор в собственном окне фрейма. Дешёвые антики патчат
+// главное окно и забывают про фреймы: тогда значения в iframe совпадут с
+// обычным браузером = утечка. Same-origin srcdoc, результат через postMessage.
+// srcdoc iframe realms. opts: { sandbox:'<flags>'|null, credentialless:bool }.
+// context names: iframe (same-origin) | sandboxed-iframe | credentialless-iframe.
+// The realm's own isolation metadata (sandbox flags, origin) is recorded so a
+// same-site subframe isn't mistaken for a cross-process OOPIF (Codex P4).
+function viaIframeVariant(context, opts){
+  opts=opts||{};
+  return new Promise(function(res){
+    try{
+      var ifr=document.createElement('iframe');
+      ifr.style.cssText='position:absolute;left:-9999px;width:120px;height:120px;border:0';
+      // Delegate the Permissions-Policy features the probe measures so a
+      // same-origin subframe can actually run them (WebGPU especially) instead of
+      // a policy-blocked realm. Ignored for the opaque-origin sandboxed frame.
+      try{ ifr.setAttribute('allow','webgpu *; gamepad *; accelerometer *; gyroscope *; magnetometer *'); }catch(_){}
+      if(opts.sandbox!=null) ifr.setAttribute('sandbox',opts.sandbox);
+      if(opts.credentialless){ try{ ifr.credentialless=true; }catch(_){} }
+      var meta='{_isolation:{context:"'+context+'",sandbox:'+(opts.sandbox!=null?JSON.stringify(opts.sandbox):'null')+',credentialless:'+(!!opts.credentialless)+',origin:(location&&location.origin)||"opaque"}}';
+      ifr.srcdoc='<!doctype html><body><script>'+COLLECTOR_SRC+
+        'function P(o){try{parent.postMessage({__fp:1,m:o},"*");}catch(_e){try{parent.postMessage({__fp:1,m:JSON.parse(JSON.stringify(o))},"*");}catch(_e2){parent.postMessage({__fp:1,m:{_context:"'+context+'",error:"post-failed:"+String(_e&&_e.name)}},"*");}}}'+
+        'self.LinkageProbe.collect("'+context+'").then(function(m){try{m._isolation='+meta+'._isolation;}catch(e){}P(m);},'+
+        'function(e){P({_context:"'+context+'",error:String(e)});});<\/script>';
+      var t=setTimeout(function(){ cleanup(); rstat(context,'timeout'); log('  ! '+context+' timeout','err'); res(); },30000);
+      function onmsg(e){ if(e&&e.source===ifr.contentWindow&&e.data&&e.data.__fp){ cleanup(); send(context,e.data.m).then(function(){rstat(context,'finished');res();},function(){rstat(context,'error','send');res();}); } }
+      function cleanup(){ clearTimeout(t); window.removeEventListener('message',onmsg); try{ ifr.remove(); }catch(_){} }
+      window.addEventListener('message',onmsg);
+      document.body.appendChild(ifr);
+    }catch(e){ rstat(context,'error',e.message); log('  ! '+context+': '+e.message,'err'); res(); }
+  });
+}
+function viaIframe(){ return viaIframeVariant('iframe',{sandbox:'allow-same-origin allow-scripts'}); }
+// Real-URL same-origin frame (not srcdoc) — served by /fingerprint/frame.
+function viaIframeUrl(){
+  return new Promise(function(res){
+    try{
+      var ifr=document.createElement('iframe');
+      ifr.style.cssText='position:absolute;left:-9999px;width:120px;height:120px;border:0';
+      try{ ifr.setAttribute('allow','webgpu *; gamepad *; accelerometer *; gyroscope *; magnetometer *'); }catch(_){}
+      ifr.src='/fingerprint/frame';
+      var t=setTimeout(function(){ cleanup(); rstat('iframe-url','timeout'); log('  ! iframe-url timeout','err'); res(); },30000);
+      function onmsg(e){ if(e&&e.source===ifr.contentWindow&&e.data&&e.data.__fp){ cleanup(); send('iframe-url',e.data.m).then(function(){rstat('iframe-url','finished');res();},function(){rstat('iframe-url','error','send');res();}); } }
+      function cleanup(){ clearTimeout(t); window.removeEventListener('message',onmsg); try{ ifr.remove(); }catch(_){} }
+      window.addEventListener('message',onmsg);
+      document.body.appendChild(ifr);
+    }catch(e){ rstat('iframe-url','error',e.message); log('  ! iframe-url: '+e.message,'err'); res(); }
+  });
+}
+function viaSandboxedIframe(){ return viaIframeVariant('sandboxed-iframe',{sandbox:'allow-scripts'}); }        // opaque origin
+function viaCredentiallessIframe(){ return viaIframeVariant('credentialless-iframe',{sandbox:'allow-same-origin allow-scripts',credentialless:true}); }
+
+// service-worker: ещё один realm. SW отдаётся роутом /fingerprint/sw (тот же
+// COLLECTOR). У SW нет fetch-обработчика — трафик не перехватывает; после снятия
+// снимаем регистрацию. Отвечает на 'go' снимком через MessageChannel-порт.
+function viaServiceWorker(){
+  return (async function(){
+    if(!('serviceWorker' in navigator)){ rstat('service-worker','unsupported','no serviceWorker'); log('  ! нет serviceWorker','err'); return; }
+    var reg;
+    try{
+      reg=await navigator.serviceWorker.register('/fingerprint/sw',{scope:'/fingerprint/'});
+      // дождаться активного воркера
+      var sw=reg.active||reg.waiting||reg.installing;
+      if(sw && sw.state!=='activated'){
+        await new Promise(function(res){ var t=setTimeout(res,8000); sw.addEventListener('statechange',function(){ if(sw.state==='activated'){ clearTimeout(t); res(); } }); });
+      }
+      var target=reg.active||navigator.serviceWorker.controller;
+      if(!target){ rstat('service-worker','timeout','not activated'); log('  ! SW не активировался','err'); try{await reg.unregister();}catch(_){}; return; }
+      var m=await new Promise(function(res,rej){
+        var ch=new MessageChannel();
+        ch.port1.onmessage=function(e){ res(e.data); };
+        target.postMessage('go',[ch.port2]);
+        setTimeout(function(){ rej(new Error('timeout')); },15000);
+      });
+      await send('service-worker',m); rstat('service-worker','finished');
+    }catch(e){ rstat('service-worker', e&&e.message==='timeout'?'timeout':'error', e&&e.message); log('  ! service-worker: '+e.message,'err'); }
+    finally{ try{ if(reg) await reg.unregister(); }catch(_){} }
+  })();
+}
+
+// cross-origin OOPIF: iframe на fp-origin (/xprobe у приёмника) — настоящий
+// другой сайт. Страница гоняет тот же COLLECTOR и постит нам результат.
+function viaCrossOrigin(){
+  return (async function(){
+    var ifr;
+    try{
+      var r=await fetch('/api/fingerprint/xprobe-url'); if(!r.ok){ rstat('cross-origin-iframe','unsupported','not deployed ('+r.status+')'); return; } // 503 = не развёрнут
+      var j=await r.json(); if(!j.url){ rstat('cross-origin-iframe','unsupported','no url'); return; }
+      ifr=document.createElement('iframe');
+      ifr.style.cssText='position:absolute;left:-9999px;width:120px;height:120px;border:0';
+      try{ ifr.setAttribute('allow','webgpu *; gamepad *; accelerometer *; gyroscope *; magnetometer *'); }catch(_){}
+      ifr.src=j.url;
+      // Expected child origin from the returned URL — verify event.origin against
+      // it and record BOTH origins (Codex v4.3 #9): a true cross-site OOPIF.
+      var childOrigin=''; try{ childOrigin=new URL(j.url).origin; }catch(_){}
+      var m=await new Promise(function(res,rej){
+        var done=false;
+        function onmsg(e){
+          // must come from OUR iframe AND from the expected cross-site origin.
+          if(e&&e.source===ifr.contentWindow&&e.origin===childOrigin&&e.data&&e.data.__fpx){
+            done=true; clearTimeout(tmo); window.removeEventListener('message',onmsg);
+            var data=e.data.m||{};
+            try{ data._crossOrigin={ parentOrigin:location.origin, childOrigin:e.origin, eventOriginVerified:true,
+              crossSite:(function(){ try{ return new URL(location.origin).hostname.split('.').slice(-2).join('.')!==new URL(e.origin).hostname.split('.').slice(-2).join('.'); }catch(_){ return null; } })() }; }catch(_){}
+            res(data);
+          }
+        }
+        window.addEventListener('message',onmsg);
+        document.body.appendChild(ifr);
+        var tmo=setTimeout(function(){ if(!done){ window.removeEventListener('message',onmsg); rej(new Error('timeout')); } },30000);
+      });
+      await send('cross-origin-iframe',m); rstat('cross-origin-iframe','finished');
+    }catch(e){ rstat('cross-origin-iframe', e&&e.message==='timeout'?'timeout':'error', e&&e.message); log('  ! cross-origin: '+e.message,'err'); }
+    finally{ try{ if(ifr) ifr.remove(); }catch(_){} }
+  })();
+}
+
+// Сетевой слой (JA4): дёргаем приёмник из ЭТОЙ же вкладки — само TLS-рукопожатие
+// к нему и есть замер. Токен просим у панели (тот же origin), приёмник кросс-
+// оригинный, поэтому no-cors: ответ не читаем, но соединение и запрос уходят.
+async function netLayer(){
+  try{
+    var qs=new URLSearchParams(location.search);
+    var env=qs.get('env'), sid=qs.get('sid');
+    if(!env) return;
+    // Two-phase Accept-CH/Critical-CH (Codex v4.3 #8): round 1 primes (server sends
+    // Accept-CH); after a short gap the browser has cached it, so round 2 carries
+    // the high-entropy hints. Each round is its own TLS connection → own JA4.
+    async function fireRound(round){
+      var tokUrl='/api/fingerprint/net-token?env='+encodeURIComponent(env)+(sid?'&sid='+encodeURIComponent(sid):'')+'&round='+round;
+      var r=await fetch(tokUrl,{method:'POST'});
+      if(!r.ok){ if(round===1) rstat('network','unsupported','net-token '+r.status); return false; }
+      var j=await r.json(); if(!j.url){ if(round===1) rstat('network','unsupported','no url'); return false; }
+      await new Promise(function(res){
+        var done=false, fin=function(){ if(done)return; done=true; res(); };
+        try{ fetch(j.url,{mode:'no-cors',cache:'no-store'}).then(fin,fin); }catch(e){ fin(); }
+        setTimeout(fin,8000);
+      });
+      return true;
+    }
+    var ok1=await fireRound(1);
+    if(!ok1) return;
+    await new Promise(function(r){ setTimeout(r,1500); });   // let the browser cache Accept-CH
+    await fireRound(2);
+    // no-cors: the ack lands server→server (capture → panel); the server confirms
+    // persistence in the side-status check before "готово".
+    rstat('network','fired');
+    log('  ✓ сетевой слой (JA4, 2-phase Accept-CH)','ok');
+  }catch(e){ rstat('network','error', e&&e.message); }
+}
+
+// Permissioned phase (optional, gesture-gated): geo / device labels / permission
+// states behind browser prompts. Never blocks the passive snapshot. Geo is kept
+// privacy-safe — accuracy + permission state + a HASH of coarse coords (so admin
+// can see if location differs plain-vs-anti WITHOUT storing the real address).
+// Permissioned phase (gesture-gated), rebuilt per Codex v4.2 #8:
+//  · permission STATES before AND after (a `prompt` is NOT `granted`);
+//  · a REAL getUserMedia({audio,video}) prompt, then per-track settings/
+//    capabilities/constraints, then tracks STOPPED;
+//  · enumerateDevices before vs after (labels reveal on grant), typed per-device
+//    kind/label/deviceId/groupId;
+//  · geolocation stored TYPED (lat/lon/accuracy/altitude/altitudeAccuracy/heading/
+//    speed/timestamp) with a coarse bucket kept only as an extra human field;
+//  · a manifest reconciling requested vs granted/denied/prompt/timeout/unsupported,
+//    with `complete` only when every requested step reached a terminal state.
+function permissionedCollect(){
+  return (async function(){
+    var out={ _context:'permissioned', _schema:'typed-v4-partial' };
+    var recs=[];
+    var manifest={ phase:'permissioned', requested:[], granted:[], denied:[], prompt:[], timeout:[], unsupported:[], steps:{}, complete:false };
+    var enc=(self.LinkageProbe&&self.LinkageProbe.encodeValue)||function(v){return {valueType:typeof v,value:v};};
+    function rec(path,status,value,err){ var e=(value===undefined)?{valueType:'undefined',value:null}:(value===null?{valueType:'null',value:null}:enc(value));
+      recs.push({path:path,context:'permissioned',phase:'permissioned',status:status,valueType:e.valueType,value:e.value,error:err||null,meta:{}}); }
+    var np=navigator.permissions, permNames=['geolocation','camera','microphone','notifications'];
+    async function queryState(name){ try{ var r=await np.query({name:name}); return r.state; }catch(e){ return 'unsupported'; } }
+
+    // 1. permission STATES before (a 'prompt' state is NOT 'granted')
+    if(np&&np.query){ for(var i=0;i<permNames.length;i++){ manifest.requested.push('perm.'+permNames[i]);
+      var sb=await queryState(permNames[i]); rec('permissioned.perm.'+permNames[i]+'.before','ok',sb); } }
+
+    // 2. enumerateDevices BEFORE gUM (labels hidden until granted)
+    async function enumerate(tag){
+      if(!(navigator.mediaDevices&&navigator.mediaDevices.enumerateDevices)) return null;
+      try{ var list=await navigator.mediaDevices.enumerateDevices();
+        var withLabels=list.filter(function(d){return d.label;}).length;
+        rec('permissioned.devices.'+tag+'.count','ok',list.length);
+        rec('permissioned.devices.'+tag+'.withLabels','ok',withLabels);
+        list.forEach(function(d,idx){
+          rec('permissioned.devices.'+tag+'['+idx+'].kind','ok',d.kind);
+          rec('permissioned.devices.'+tag+'['+idx+'].label','ok',d.label||'');
+          rec('permissioned.devices.'+tag+'['+idx+'].deviceId','ok',d.deviceId||'');
+          rec('permissioned.devices.'+tag+'['+idx+'].groupId','ok',d.groupId||'');
+        });
+        return {count:list.length, withLabels:withLabels};
+      }catch(e){ rec('permissioned.devices.'+tag,'error',null,{name:e.name,message:e.message}); return null; }
+    }
+    manifest.requested.push('enumerateDevices');
+    var devBefore=await enumerate('before'); manifest.steps.enumerateBefore=!!devBefore;
+
+    // 3. getUserMedia({audio,video}) — the REAL prompt; capture then stop tracks
+    manifest.requested.push('getUserMedia');
+    var gumState='unsupported';
+    if(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia){
+      try{
+        var stream=await new Promise(function(resolve,reject){
+          var t=setTimeout(function(){reject(new Error('timeout'));},20000);
+          navigator.mediaDevices.getUserMedia({audio:true,video:true}).then(function(s){clearTimeout(t);resolve(s);},function(e){clearTimeout(t);reject(e);});
+        });
+        gumState='granted'; manifest.granted.push('getUserMedia');
+        stream.getTracks().forEach(function(tr,idx){
+          rec('permissioned.track['+idx+'].kind','ok',tr.kind);
+          rec('permissioned.track['+idx+'].label','ok',tr.label||'');
+          try{ rec('permissioned.track['+idx+'].settings','ok', tr.getSettings?tr.getSettings():null); }catch(e){}
+          try{ rec('permissioned.track['+idx+'].capabilities','ok', tr.getCapabilities?tr.getCapabilities():null); }catch(e){}
+          try{ rec('permissioned.track['+idx+'].constraints','ok', tr.getConstraints?tr.getConstraints():null); }catch(e){}
+          try{ tr.stop(); }catch(e){}                    // release camera/mic
+        });
+      }catch(e){
+        var nm=e&&e.name;
+        if(nm==='NotAllowedError'||nm==='SecurityError'){ gumState='denied'; manifest.denied.push('getUserMedia'); rec('permissioned.getUserMedia','permission-denied',null,{name:nm,message:e.message}); }
+        else if(e&&e.message==='timeout'){ gumState='timeout'; manifest.timeout.push('getUserMedia'); rec('permissioned.getUserMedia','timeout',null); }
+        else if(nm==='NotFoundError'||nm==='OverconstrainedError'){ gumState='no-device'; manifest.unsupported.push('getUserMedia'); rec('permissioned.getUserMedia','unavailable-in-context',null,{name:nm,message:e.message}); }
+        else { gumState='error'; rec('permissioned.getUserMedia','error',null,{name:nm,message:e&&e.message}); }
+      }
+    } else { manifest.unsupported.push('getUserMedia'); rec('permissioned.getUserMedia','unavailable-in-context',null); }
+    rec('permissioned.getUserMedia.result','ok',gumState); manifest.steps.getUserMedia=gumState;
+
+    // 4. enumerateDevices AFTER — labels now visible if granted
+    var devAfter=await enumerate('after'); manifest.steps.enumerateAfter=!!devAfter;
+    if(devBefore&&devAfter) rec('permissioned.devices.labelsRevealed','ok', (devAfter.withLabels>devBefore.withLabels));
+
+    // 5. geolocation — TYPED coords + coarse bucket as an extra human field
+    manifest.requested.push('geolocation');
+    if(navigator.geolocation){
+      var geo=await new Promise(function(res){ var t=setTimeout(function(){res({s:'timeout'});},15000);
+        navigator.geolocation.getCurrentPosition(function(p){ clearTimeout(t); res({s:'ok', c:p.coords, ts:p.timestamp}); },
+          function(err){ clearTimeout(t); res({s:err.code===1?'denied':err.code===3?'timeout':err.code===2?'unavailable':'error', code:err.code, msg:err.message}); },
+          {timeout:12000, maximumAge:0, enableHighAccuracy:true}); });
+      if(geo.s==='ok'){
+        var c=geo.c;
+        ['latitude','longitude','accuracy','altitude','altitudeAccuracy','heading','speed'].forEach(function(k){
+          var v=c[k]; rec('permissioned.geo.'+k, (v===null||v===undefined)?'unavailable-in-context':'ok', (v===null||v===undefined)?null:v); });
+        rec('permissioned.geo.timestamp','ok',geo.ts);
+        var r1=function(n){return Math.round(n*10)/10;};
+        rec('permissioned.geo.coarseBucket','ok', LinkageProbe.hash(r1(c.latitude)+','+r1(c.longitude)));  // extra human field only
+        manifest.granted.push('geolocation'); manifest.steps.geolocation='granted';
+      } else if(geo.s==='denied'){ rec('permissioned.geo','permission-denied',null); manifest.denied.push('geolocation'); manifest.steps.geolocation='denied'; }
+      else if(geo.s==='timeout'){ rec('permissioned.geo','timeout',null); manifest.timeout.push('geolocation'); manifest.steps.geolocation='timeout'; }
+      // POSITION_UNAVAILABLE (code 2) is an environment outcome, not a collector
+      // bug → unavailable-in-context (an enumerated allowed state), never `error`.
+      else if(geo.s==='unavailable'){ rec('permissioned.geo','unavailable-in-context',null,{name:'GeolocationError',message:String(geo.code)}); manifest.unsupported.push('geolocation'); manifest.steps.geolocation='unavailable'; }
+      else { rec('permissioned.geo','error',null,{name:'GeolocationError',message:String(geo.code)}); manifest.steps.geolocation='error'; }
+    } else { rec('permissioned.geo','unavailable-in-context',null); manifest.unsupported.push('geolocation'); manifest.steps.geolocation='unsupported'; }
+
+    // 6. permission STATES after (capture the transition; prompt != granted)
+    if(np&&np.query){ for(var j=0;j<permNames.length;j++){ var sa=await queryState(permNames[j]); rec('permissioned.perm.'+permNames[j]+'.after','ok',sa);
+      if(sa==='granted'){ if(manifest.granted.indexOf('perm.'+permNames[j])<0) manifest.granted.push('perm.'+permNames[j]); }
+      else if(sa==='denied'){ if(manifest.denied.indexOf('perm.'+permNames[j])<0) manifest.denied.push('perm.'+permNames[j]); }
+      else if(sa==='prompt'){ manifest.prompt.push('perm.'+permNames[j]); }
+      else { manifest.unsupported.push('perm.'+permNames[j]); }
+    } }
+
+    // 7. complete = every requested step reached a TERMINAL state (grant/deny/…),
+    //    NOT merely that a record exists.
+    manifest.complete = manifest.steps.enumerateBefore===true && manifest.steps.enumerateAfter===true
+      && !!manifest.steps.getUserMedia && !!manifest.steps.geolocation;
+    rec('permissioned.phase.complete','ok',manifest.complete);
+
+    out._measurements=recs; out._phaseManifest=manifest;
+    return out;
+  })();
+}
+
+(async function(){
+  log('идёт сбор…','big');
+  try{ await send('main-frame', await LinkageProbe.collect('main-frame')); rstat('main-frame','finished'); }catch(e){ rstat('main-frame','error',e.message); log('main-frame: '+e.message,'err'); }
+  await viaWorker('dedicated-worker');
+  await viaWorker('dedicated-worker-module');
+  await viaWorker('shared-worker');
+  await viaWorker('shared-worker-module');
+  await viaWorklet();
+  await viaIframe();
+  await viaIframeUrl();
+  await viaSandboxedIframe();
+  await viaCredentiallessIframe();
+  await viaServiceWorker();
+  await viaCrossOrigin();
+  await netLayer();
+  // Permissioned phase is REQUIRED and comes BEFORE "готово": the browser prompts
+  // (geo / camera+mic device labels) need a user gesture, so we surface a
+  // mandatory button and only declare done AFTER it completes.
+  log('Остался один обязательный шаг — нажми кнопку ниже ↓','big');
+  var wrap=document.createElement('div'); wrap.style.cssText='margin-top:16px';
+  var hint=document.createElement('div');
+  hint.style.cssText='font:13px system-ui;margin-bottom:8px;color:#c9d1d9';
+  hint.innerHTML='⚠️ <b>Обязательно:</b> нажми и разреши гео и устройства во всплывающих окнах — без этого сбор неполный.';
+  var btn=document.createElement('button');
+  btn.textContent='📍 Разрешить гео и устройства (обязательно)';
+  btn.style.cssText='padding:10px 16px;font:14px system-ui;cursor:pointer';
+  // Every realm the run attempts. The terminal manifest records a status for each
+  // (finished/timeout/blocked/unsupported/error) — presence of one line is NOT
+  // completion (Codex v4.2 #5). credentialless-iframe is Chrome-only, so it's
+  // expected-optional and doesn't block "готово" when unsupported.
+  var EXPECTED=['main-frame','dedicated-worker','dedicated-worker-module','shared-worker','shared-worker-module',
+    'audio-worklet','iframe','iframe-url','sandboxed-iframe','credentialless-iframe','service-worker','cross-origin-iframe','network','permissioned'];
+  function buildManifest(){
+    var acks={}; SENDLOG.forEach(function(s){ if(!acks[s.context])acks[s.context]={ok:false,last:s.status}; if(s.ok)acks[s.context].ok=true; acks[s.context].last=s.status; });
+    var realms={};
+    EXPECTED.forEach(function(r){
+      var st=REALM_STATUS[r];
+      if(st) realms[r]=st;
+      else if(acks[r]&&acks[r].ok) realms[r]={status:'finished'};
+      else realms[r]={status:'missing'};
+    });
+    return { _context:'run-manifest', expected:EXPECTED, realms:realms, acks:acks, sendLog:SENDLOG,
+      builtAt:(new Date()).toISOString(), collectorVersion:(self.LinkageProbe&&self.LinkageProbe.version)||null };
+  }
+  function finishAndReport(){
+    // Post the terminal manifest, then ASK THE SERVER whether every canonically
+    // expected context (incl. the persisted network record) actually landed —
+    // «готово» requires the server's confirmation, not the client's own manifest
+    // (Codex v4.3 #1). A landed first line is never "done".
+    var man=buildManifest();
+    return send('run-manifest', man).then(function(){
+      var qs=new URLSearchParams(location.search), env=qs.get('env'), sid=qs.get('sid');
+      if(!env||!sid){ log('готово локально (сессия без env/sid — НЕ боевой снимок)','err'); return false; }
+      return fetch('/api/fingerprint/side-status?env='+encodeURIComponent(env)+'&sid='+encodeURIComponent(sid),{cache:'no-store'})
+        .then(function(r){ if(!r.ok) throw new Error('side-status '+r.status); return r.json(); })
+        .then(function(st){
+          if(st&&st.complete){ log('готово — сервер подтвердил полный сбор этой стороны ('+(st.present?st.present.length:'?')+' контекстов), можно закрывать вкладку','big'); return true; }
+          log('сбор записан, но сервер НЕ подтвердил полноту — не хватает: '+((st&&st.missing)||[]).join(', ')+' — это НЕ боевой снимок','err'); return false;
+        });
+    });
+  }
+  btn.onclick=function(){ btn.disabled=true; btn.textContent='снимаю…';
+    permissionedCollect().then(function(m){ return send('permissioned',m); }).then(function(){
+      rstat('permissioned','finished');
+      btn.textContent='записываю итог…';
+      return finishAndReport();
+    }).then(function(serverConfirmed){
+      btn.textContent = serverConfirmed ? '✓ готово (подтверждено сервером)' : 'сбор неполный — см. лог, нажми ещё раз';
+      if(!serverConfirmed) btn.disabled=false;
+    }, function(e){
+      rstat('permissioned', REALM_STATUS['permissioned']?REALM_STATUS['permissioned'].status:'error', e&&e.message);
+      btn.textContent='не удалось (сеть?) — нажми ещё раз'; btn.disabled=false;
+      log('  ✗ не удалось записать итог: '+(e&&e.message||e),'err');
+    });
+  };
+  wrap.appendChild(hint); wrap.appendChild(btn);
+  logEl.parentNode.insertBefore(wrap, logEl.nextSibling);
+})();
+</script>
