@@ -228,7 +228,7 @@ ok("all iframe variants explicitly delegate the keyboard-map policy",
 ok("the terminal manifest repeats the same capture identity",
   html.includes("identity:RUN_IDENTITY"));
 ok("AudioWorklet reuses the injected SHA implementation and emits its own manifest",
-  html.includes("WORKLET_SRC=COLLECTOR_SRC+") && html.includes("self.LinkageProbe.sha256hex")
+  html.includes('WORKLET_SRC="var self=globalThis;\\n"+COLLECTOR_SRC+') && html.includes("self.LinkageProbe.sha256hex")
     && html.includes("'worklet.__manifest'"));
 
 {

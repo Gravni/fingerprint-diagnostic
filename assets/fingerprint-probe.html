@@ -1853,7 +1853,12 @@ var WORKER_SRC="self.onmessage=async()=>{var m=await self.LinkageProbe.collect('
 // must not blindly reference navigator (that threw ReferenceError -> ERR:*);
 // missing APIs report 'unavailable-in-context'. Only genuinely-available worklet
 // globals (sampleRate/currentTime/currentFrame) plus Intl/Math are measured.
-var WORKLET_SRC=COLLECTOR_SRC+"class Probe extends AudioWorkletProcessor{constructor(){super();this.port.onmessage=()=>{"
+// AudioWorkletGlobalScope is a WorkletGlobalScope: it exposes globalThis but NO
+// `self` (nor navigator/TextEncoder/URL/crypto). The collector's IIFE tail
+// `})(self)` therefore throws at module evaluation — and Chromium resolves
+// addModule() regardless, so the only symptom was "node name 'probe' is not
+// defined" (C1 smoke 2026-09-07). Alias `self` before the collector bytes.
+var WORKLET_SRC="var self=globalThis;\n"+COLLECTOR_SRC+"\n"+"class Probe extends AudioWorkletProcessor{constructor(){super();this.port.onmessage=()=>{"
   +"var S=(f)=>{try{var v=f();return v===undefined?'undef':v;}catch(e){return 'ERR:'+e.name;}};"
   +"var NAV=(g)=>S(()=>typeof navigator==='undefined'?'unavailable-in-context':g());"
   +"var H=(s)=>self.LinkageProbe.sha256hex(String(s));"
