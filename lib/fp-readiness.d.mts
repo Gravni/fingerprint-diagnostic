@@ -70,6 +70,10 @@ export interface SideCaptureInput {
   readonly serverExpectedContexts: readonly string[];
   readonly records: readonly PersistedCaptureRecord[];
   readonly unreadableLines?: number;
+  /** Durable, server-owned inventory for refs sealed into this capture. */
+  readonly storedBlobLocators?: readonly string[];
+  /** Preferred full sidecars; hashes and metadata are re-verified at readiness. */
+  readonly storedBlobInventory?: readonly import("./fp-blob.mjs").FingerprintBlobSidecar[];
   readonly requiredControls?: readonly ControlEngineRequirement[];
 }
 

@@ -5,6 +5,7 @@ import {
   validatePairedCapture,
 } from "../lib/fp-readiness.mjs";
 import { encodeValue } from "../lib/fp-encode.mjs";
+import { blobLocatorForAddress } from "../lib/fp-blob.mjs";
 
 let pass = 0, fail = 0;
 function ok(label, cond) { if (cond) pass++; else { fail++; console.log("  ✗ " + label); } }
@@ -2034,6 +2035,45 @@ const has = (result, code) => result.issues.some((x) => x.code === code);
   target.measurements._phaseManifest.complete = false;
   const verdict = validateSideCapture(incompletePermissioned);
   ok("ADVERSARIAL: incomplete permissioned phase is not captureComplete", verdict.captureComplete === false);
+}
+
+// Content-addressed refs are complete only after the server verified/persisted
+// the exact sidecar and the durable store inventory confirms its locator.
+{
+  const input = fullInput();
+  const sidecars = [];
+  const encoded = encodeValue("readiness-large-payload".repeat(1000), { blobSink(blob) {
+    const locator = blobLocatorForAddress(blob.addressSha256);
+    sidecars.push({ ...blob, locator });
+    return { locator, stored: false };
+  } });
+  const main = input.records.find((row) => row.context === "main-frame");
+  main.measurements._measurements.push({
+    path: "diagnostic.large", context: "main-frame", phase: "passive", status: "ok",
+    valueType: encoded.valueType, value: encoded.value, error: null, meta: {},
+  });
+  syncCollectorManifest(main);
+  input.storedBlobLocators = [encoded.value.__blobRef.locator];
+  const unsealed = validateSideCapture(input);
+  ok("client stored:false blob blocks READY and captureComplete even when its locator exists",
+    !unsealed.ready && unsealed.captureComplete === false && has(unsealed, "blob-ref-unsealed"));
+
+  encoded.value.__blobRef.stored = true;
+  input.storedBlobLocators = [];
+  const missing = validateSideCapture(input);
+  ok("sealed blob absent from durable inventory blocks READY and captureComplete",
+    !missing.ready && missing.captureComplete === false && has(missing, "blob-payload-missing"));
+
+  delete input.storedBlobLocators;
+  main.measurements._blobs = sidecars;
+  const complete = validateSideCapture(input);
+  ok("sealed blob backed by full durable sidecar preserves READY and captureComplete",
+    complete.ready === true && complete.captureComplete === true);
+
+  main.measurements._blobs[0].payload += "corrupt";
+  const corrupt = validateSideCapture(input);
+  ok("durable sidecar corruption blocks READY and captureComplete",
+    corrupt.ready === false && corrupt.captureComplete === false && has(corrupt, "blob-payload-hash-mismatch"));
 }
 
 console.log(`\nfp-readiness: ${pass} passed, ${fail} failed`);

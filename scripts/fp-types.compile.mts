@@ -10,6 +10,11 @@ import {
   type OopifEvidence,
   type SideCaptureInput,
 } from "../lib/fp-readiness.mjs";
+import {
+  auditStoredBlobReferences,
+  blobLocatorForAddress,
+  verifyAndSealBlobSidecars,
+} from "../lib/fp-blob.mjs";
 
 const oopifBinding = {
   parentOrigin: "https://panel.example.test",
@@ -54,6 +59,7 @@ const side: SideCaptureInput = {
   records: [record],
   unreadableLines: 0,
   oopif: oopifEvidence,
+  storedBlobLocators: [],
 };
 
 const one = validateSideCapture(side);
@@ -69,3 +75,6 @@ const pair = validatePairedCapture({
 void one.issues;
 void pair.issues;
 void DEFAULT_COLLECTOR_JOBS;
+void blobLocatorForAddress("a".repeat(64));
+void auditStoredBlobReferences({}, []);
+void verifyAndSealBlobSidecars({}, []);

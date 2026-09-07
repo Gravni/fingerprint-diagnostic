@@ -118,6 +118,27 @@ function COLLECTOR(root){
   // iframe / OOPIF realm unchanged.
   /*__FP_ENCODE_INJECT__*/
   if(typeof encodeValue==='undefined'){ throw new Error('fp-encode not injected'); }
+  // A blob digest is not retained data. The browser stages each complete
+  // oversized payload beside the measurement envelope and always advertises
+  // `stored:false`; only the server may flip that flag after hash verification
+  // and durable persistence. Content addresses deduplicate within one realm.
+  function createBlobSidecarBag(){
+    var byLocator=Object.create(null);
+    function sink(blob){
+      if(!blob||blob.complete!==true||blob.hashScope!=='content'
+          ||typeof blob.addressSha256!=='string'||!/^[0-9a-f]{64}$/.test(blob.addressSha256)) return null;
+      var locator='fpblob:v1:'+blob.addressSha256;
+      if(!byLocator[locator]) byLocator[locator]={
+        kind:blob.kind,length:blob.length,lengthUnit:blob.lengthUnit,
+        sha256:blob.sha256,fnv:blob.fnv,addressSha256:blob.addressSha256,addressFnv:blob.addressFnv,
+        reason:blob.reason,encoding:blob.encoding,addressVersion:blob.addressVersion,
+        complete:true,hashScope:'content',locator:locator,payload:blob.payload
+      };
+      return {locator:locator,stored:false};
+    }
+    function values(){return Object.keys(byLocator).sort().map(function(k){return byLocator[k];});}
+    return {sink:sink,values:values};
+  }
   // Typed deep-walk over a live native object → array of measurement records
   // {path,context,phase,status,valueType,value,error,meta}. Reads the SAME
   // getters as walk() but preserves native types instead of stringifying.
@@ -151,7 +172,7 @@ function COLLECTOR(root){
         if(tv==='object' && val!==null && !Array.isArray(val) && !isSpecialObj && depth<md){
           rec(val,p,depth+1); continue;
         }
-        push(p,STATUS.ok,encodeValue(val),null);
+        push(p,STATUS.ok,encodeObserved(val),null);
       }
     }
     rec(rootObj,label,0);
@@ -166,12 +187,16 @@ function COLLECTOR(root){
 
   // Current collect() context/phase + the typed record sink. Set at the start of
   // collect(); M()/MA() push into CUR.recs while blocks run.
-  var CUR={context:'main-frame',phase:'passive',recs:null};
+  var CUR={context:'main-frame',phase:'passive',recs:null,blobs:null};
+  function encodeObserved(value){
+    return encodeValue(value,CUR.blobs?{blobSink:CUR.blobs.sink}:undefined);
+  }
   function nowMs(){ return (root.performance&&root.performance.now)?root.performance.now():Date.now(); }
   function pushRec(path,status,enc,error,dur){
     if(!CUR.recs) return;
     var m={durationMs:+(dur||0).toFixed(3)};
-    if(enc){ if(enc.special)m.special=enc.special; if(enc.count!=null)m.count=enc.count; }
+    if(enc){ if(enc.special)m.special=enc.special; if(enc.count!=null)m.count=enc.count;
+      if(enc.signatureRef)m.signatureRef=enc.signatureRef; }
     CUR.recs.push({path:path,context:CUR.context,phase:CUR.phase,status:status,
       valueType:enc?enc.valueType:null,value:enc?enc.value:null,error:error||null,meta:m});
   }
@@ -195,7 +220,7 @@ function COLLECTOR(root){
     try{
       var v=fn();
       if(v&&typeof v==='object'&&v.__mstatus){ status=v.__mstatus; enc={valueType:'null',value:null}; legacy=v.__mstatus; }
-      else { legacy=(v===undefined?'undef':v); enc=encodeValue(v); }
+      else { legacy=(v===undefined?'undef':v); enc=encodeObserved(v); }
     }
     catch(e){
       // A SecurityError is an ACCESS DENIAL (policy / opaque origin / disabled
@@ -213,7 +238,7 @@ function COLLECTOR(root){
   function MA(path,fn){
     var t0=nowMs();
     return Promise.resolve().then(fn).then(function(v){
-      pushRec(path,STATUS.ok,encodeValue(v),null,nowMs()-t0);
+      pushRec(path,STATUS.ok,encodeObserved(v),null,nowMs()-t0);
       return v===undefined?'undef':v;
     },function(e){
       // SecurityError → blocked (access denial, not a bug); else error (Codex #6).
@@ -1701,8 +1726,8 @@ function COLLECTOR(root){
   /* ---- сборка одного контекста ---------------------------------------- */
   function collect(contextName){
     var t0=(root.performance||Date).now();
-    var meas=[];
-    CUR.context=contextName; CUR.phase='passive'; CUR.recs=meas;
+    var meas=[], blobBag=createBlobSidecarBag();
+    CUR.context=contextName; CUR.phase='passive'; CUR.recs=meas; CUR.blobs=blobBag;
     return Promise.resolve().then(function(){
       var base={ _context:contextName };
       Object.assign(base, deepBlock());
@@ -1783,7 +1808,7 @@ function COLLECTOR(root){
             if(typeof document!=='undefined'&&document){
               ['characterSet','compatMode','referrer','visibilityState'].forEach(function(k){
                 var v,er=null; try{v=document[k];}catch(e){er={name:e.name,message:e.message};}
-                var enc=er?null:encodeValue(v);
+                var enc=er?null:encodeObserved(v);
                 meas.push({path:'document.'+k,context:contextName,phase:'passive',
                   status:er?STATUS.error:STATUS.ok,valueType:enc?enc.valueType:null,
                   value:enc?enc.value:null,error:er,meta:{}});
@@ -1793,15 +1818,16 @@ function COLLECTOR(root){
             var completedJobs=parts.map(function(kv){return kv[0];});
             var failedJobs=meas.filter(function(r){return r&&/\.__job$/.test(r.path||'')&&r.status!=='ok';})
               .map(function(r){return String(r.path).slice(0,-6);});
-            var cm=encodeValue({collectorVersion:'4.4.0',context:contextName,
+            var cm=encodeObserved({collectorVersion:'4.4.0',context:contextName,
               expectedJobs:expectedJobs,completedJobs:completedJobs,failedJobs:failedJobs,
               measurementCount:meas.length+1});
             meas.push({path:'collector.__manifest',context:contextName,phase:'passive',status:STATUS.ok,
               valueType:cm.valueType,value:cm.value,error:null,meta:{}});
             base._measurements=meas;
             base._schema='typed-v4';
+            base._blobPayloads=blobBag.values();
           }catch(e){ base._measurementsError='ERR:'+(e&&e.name); }
-          CUR.recs=null;
+          CUR.recs=null; CUR.blobs=null;
           base._collectMs=Math.round(((root.performance||Date).now())-t0);
           return base;
         });
@@ -1809,7 +1835,8 @@ function COLLECTOR(root){
   }
 
   root.LinkageProbe={ collect:collect, hash:hash, sha256hex:sha256hex, walk:walk,
-    walkTyped:walkTyped, encodeValue:encodeValue, version:'4.4.0' };
+    walkTyped:walkTyped, encodeValue:encodeValue, createBlobSidecarBag:createBlobSidecarBag,
+    version:'4.4.0' };
 }
 COLLECTOR(typeof self!=='undefined'?self:this);
 
@@ -2020,8 +2047,14 @@ function rstat(name,status,detail){ if(!REALM_STATUS[name]||REALM_STATUS[name].s
 // must not hang still use .then(res,res); the failure is recorded in SENDLOG.
 function send(context,m){
   if(!RUN_IDENTITY) return Promise.reject(new Error('capture identity not initialized'));
+  var clean={}, blobs=[];
+  Object.keys(m||{}).forEach(function(k){
+    if(k==='_blobPayloads'){
+      if(Array.isArray(m[k])) blobs=m[k].slice();
+    }else clean[k]=m[k];
+  });
   return boundedFetch(COLLECT_URL,{method:'POST',headers:{'content-type':'application/json'},
-    body:JSON.stringify({context:context,m:m,identity:RUN_IDENTITY})},15000).then(function(r){
+    body:JSON.stringify({context:context,m:clean,blobs:blobs,identity:RUN_IDENTITY})},15000).then(function(r){
       SENDLOG.push({context:context,ok:r.ok,status:r.status});
       if(!r.ok){ log('  ✗ '+context+' '+r.status,'err'); throw new Error('http-'+r.status); }
       log('  ✓ '+context+' ('+Object.keys(m).length+' параметров)','ok');
@@ -2033,7 +2066,44 @@ function send(context,m){
     });
 }
 function createCompletionStateMachine(deps){
-  var state={permissionedAck:false,manifestAck:false}, inFlight=null;
+  var state={permissionedAck:false,manifestAck:false,manifestAttempted:false}, inFlight=null;
+  var manifestPayload=null;
+  function frozenManifest(){
+    if(manifestPayload===null) manifestPayload=deps.buildManifest();
+    return manifestPayload;
+  }
+  function sendManifest(){
+    state.manifestAttempted=true;
+    return deps.send('run-manifest',frozenManifest()).then(function(){state.manifestAck=true;return null;},function(sendError){
+      // The response may have been lost after the atomic server commit. Recover
+      // in this same click by checking the exact committed digest. If it is not
+      // ours, replay our frozen payload once and let the server either commit it
+      // or return the real conflict.
+      return deps.queryStatus().then(function(status){
+        if(manifestCommitted(status)){state.manifestAck=true;return status;}
+        return deps.send('run-manifest',frozenManifest()).then(function(){state.manifestAck=true;return null;});
+      },function(){throw sendError;});
+    });
+  }
+  function manifestCommitted(status){
+    var payload=frozenManifest();
+    return !!(status&&typeof status.committedManifestSha256==='string'
+      &&status.committedManifestSha256===payload.manifestSha256);
+  }
+  function manifestStep(){
+    if(state.manifestAck) return Promise.resolve(null);
+    if(!state.manifestAttempted) return sendManifest();
+    // A missing HTTP response is ambiguous: the server may already have
+    // committed and closed the capture. Ask the durable status endpoint first;
+    // only replay the exact same manifest when it was not committed.
+    return deps.queryStatus().then(function(status){
+      if(manifestCommitted(status)){
+        state.manifestAck=true;
+        return status;
+      }
+      return sendManifest();
+    });
+  }
   function step(){
     var permissionStep;
     if(state.permissionedAck) permissionStep=Promise.resolve();
@@ -2043,10 +2113,9 @@ function createCompletionStateMachine(deps){
       state.permissionedAck=true;
       if(deps.permissionedAcknowledged) deps.permissionedAcknowledged();
     });
-    return permissionStep.then(function(){
-      if(state.manifestAck) return;
-      return deps.send('run-manifest',deps.buildManifest()).then(function(){state.manifestAck=true;});
-    }).then(function(){return deps.queryStatus();});
+    return permissionStep.then(manifestStep).then(function(recoveredStatus){
+      return recoveredStatus||deps.queryStatus();
+    });
   }
   function run(){
     if(inFlight)return inFlight;
@@ -2068,17 +2137,18 @@ function blobURL(src){ return URL.createObjectURL(new Blob([src],{type:'text/jav
 // it on the main thread, classifying the worklet's sentinels into real statuses.
 function typifyWorklet(m, context){
   var recs=[], enc=(self.LinkageProbe&&self.LinkageProbe.encodeValue)||null;
+  var bag=(self.LinkageProbe&&self.LinkageProbe.createBlobSidecarBag)?self.LinkageProbe.createBlobSidecarBag():null;
   Object.keys(m).forEach(function(k){
     if(k==='_context'||k==='_measurements'||k==='_schema') return;
     var v=m[k], status='ok', err=null, ev={valueType:'string',value:v};
     if(v==='unavailable-in-context'){ status='unavailable-in-context'; ev={valueType:'null',value:null}; }
     else if(v==='undef'){ ev={valueType:'undefined',value:null}; }
     else if(typeof v==='string' && v.indexOf('ERR:')===0){ status='error'; err={name:v.slice(4),message:''}; ev={valueType:null,value:null}; }
-    else if(enc){ ev=enc(v); }
+    else if(enc){ ev=enc(v,bag?{blobSink:bag.sink}:undefined); }
     var meta={}; if(ev.special)meta.special=ev.special; if(ev.count!=null)meta.count=ev.count;
     recs.push({path:k,context:context,phase:'passive',status:status,valueType:ev.valueType,value:ev.value,error:err,meta:meta});
   });
-  return recs;
+  return {records:recs,blobs:bag?bag.values():[]};
 }
 
 // kind: dedicated-worker | shared-worker (+ '-module' variants). Module workers
@@ -2159,7 +2229,8 @@ function viaWorklet(){
         catch(error){finish(rej,error);return;}
         Promise.resolve(rendering).then(function(){},function(error){finish(rej,error);});
       });
-      try{ m._measurements=typifyWorklet(m,'audio-worklet'); m._schema='typed-v4'; }catch(_){}
+      try{ var typed=typifyWorklet(m,'audio-worklet'); m._measurements=typed.records;
+        m._blobPayloads=typed.blobs; m._schema='typed-v4'; }catch(_){}
       await send('audio-worklet',m); rstat('audio-worklet','finished');
     }catch(e){ rstat('audio-worklet', e&&e.name==='TimeoutError'?'timeout':'error', e&&e.message); log('  ! audio-worklet: '+e.message,'err'); }
     finally{cleanup();}
@@ -2503,7 +2574,8 @@ function permissionedCollect(){
     var recs=[];
     var manifest={ phase:'permissioned', requested:[], granted:[], denied:[], prompt:[], timeout:[], unsupported:[], steps:{}, complete:false };
     var enc=(self.LinkageProbe&&self.LinkageProbe.encodeValue)||function(v){return {valueType:typeof v,value:v};};
-    function rec(path,status,value,err){ var e=(value===undefined)?{valueType:'undefined',value:null}:(value===null?{valueType:'null',value:null}:enc(value));
+    var blobBag=(self.LinkageProbe&&self.LinkageProbe.createBlobSidecarBag)?self.LinkageProbe.createBlobSidecarBag():null;
+    function rec(path,status,value,err){ var e=(value===undefined)?{valueType:'undefined',value:null}:(value===null?{valueType:'null',value:null}:enc(value,blobBag?{blobSink:blobBag.sink}:undefined));
       recs.push({path:path,context:'permissioned',phase:'permissioned',status:status,valueType:e.valueType,value:e.value,error:err||null,meta:{}}); }
     var np=navigator.permissions, permNames=['geolocation','camera','microphone','notifications'];
     async function queryState(name){ try{ var r=await np.query({name:name}); return r.state; }catch(e){ return 'unsupported'; } }
@@ -2680,6 +2752,7 @@ function permissionedCollect(){
     rec('permissioned.phase.complete','ok',manifest.complete);
 
     out._measurements=recs; out._phaseManifest=manifest;
+    out._blobPayloads=blobBag?blobBag.values():[];
     return out;
   })();
 }
@@ -2718,7 +2791,9 @@ function permissionedCollect(){
   // matrix; no browser capability report is allowed to shrink it.
   var EXPECTED=['main-frame','dedicated-worker','dedicated-worker-module','shared-worker','shared-worker-module',
     'audio-worklet','iframe','iframe-url','sandboxed-iframe','credentialless-iframe','service-worker','cross-origin-iframe','network','permissioned'];
+  var FROZEN_MANIFEST=null;
   function buildManifest(){
+    if(FROZEN_MANIFEST!==null) return FROZEN_MANIFEST;
     var acks={}; SENDLOG.forEach(function(s){ if(!acks[s.context])acks[s.context]={ok:false,last:s.status}; if(s.ok)acks[s.context].ok=true; acks[s.context].last=s.status; });
     var realms={};
     EXPECTED.forEach(function(r){
@@ -2727,8 +2802,11 @@ function permissionedCollect(){
       else if(acks[r]&&acks[r].ok) realms[r]={status:'finished'};
       else realms[r]={status:'missing'};
     });
-    return { _context:'run-manifest', expected:EXPECTED, realms:realms, acks:acks, sendLog:SENDLOG, identity:RUN_IDENTITY,
+    var manifest={ _context:'run-manifest', expected:EXPECTED.slice(), realms:realms, acks:acks, sendLog:SENDLOG.slice(), identity:RUN_IDENTITY,
       builtAt:(new Date()).toISOString(), collectorVersion:(self.LinkageProbe&&self.LinkageProbe.version)||null };
+    manifest.manifestSha256=LinkageProbe.sha256hex(canonicalIdentityJson(manifest));
+    FROZEN_MANIFEST=manifest;
+    return FROZEN_MANIFEST;
   }
   function querySideStatus(){
     var qs=new URLSearchParams(location.search), env=qs.get('env'), sid=qs.get('sid');

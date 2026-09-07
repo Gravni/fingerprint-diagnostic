@@ -32,7 +32,21 @@ ok("complete content-addressed blobRef is valid", validateMeasurement(rec({ valu
   fnv: "deadbeef", addressFnv: "feedface", length: 99, preview: "x",
   reason: "string-limit", encoding: "utf-8", addressVersion: "fp-blob-address-v1",
   complete: true, hashScope: "content", lengthUnit: "utf16-code-units", stored: false,
+  locator: "fpblob:v1:" + "b".repeat(64),
 } } })).length === 0);
+ok("complete blobRef without its deterministic locator is rejected", validateMeasurement(rec({ valueType: "string", value: { __blobRef: {
+  kind: "string", sha256: "a".repeat(64), addressSha256: "b".repeat(64),
+  fnv: "deadbeef", addressFnv: "feedface", length: 99, preview: "x",
+  reason: "string-limit", encoding: "utf-8", addressVersion: "fp-blob-address-v1",
+  complete: true, hashScope: "content", lengthUnit: "utf16-code-units", stored: false,
+} } })).includes("blobref-locator"));
+ok("blobRef locator must encode its own addressSha256", validateMeasurement(rec({ valueType: "string", value: { __blobRef: {
+  kind: "string", sha256: "a".repeat(64), addressSha256: "b".repeat(64),
+  fnv: "deadbeef", addressFnv: "feedface", length: 99, preview: "x",
+  reason: "string-limit", encoding: "utf-8", addressVersion: "fp-blob-address-v1",
+  complete: true, hashScope: "content", lengthUnit: "utf16-code-units", stored: true,
+  locator: "fpblob:v1:" + "c".repeat(64),
+} } })).includes("blobref-locator"));
 ok("explicitly incomplete blobRef blocks a current capture", validateMeasurement(rec({ valueType: "string", value: { __blobRef: {
   kind: "string", sha256: "a".repeat(64), fnv: "deadbeef", length: 99, preview: "x",
   complete: false, hashScope: "marker", stored: false,

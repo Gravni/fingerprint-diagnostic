@@ -120,6 +120,11 @@ ok("identity binds the exact collector artifact and verifies its local bytes",
   html.includes("browserCollectorArtifactSha256")
     && html.includes("LinkageProbe.sha256hex(COLLECTOR_SRC)!==EMBEDDED_COLLECTOR_ARTIFACT_SHA256")
     && html.includes("collectorArtifactSha256:artifact"));
+ok("collector stages complete blob sidecars without claiming server persistence",
+  html.includes("function createBlobSidecarBag(")
+    && html.includes("stored:false") && html.includes("_blobPayloads"));
+ok("top-level function signature refs are retained in typed record metadata",
+  html.includes("if(enc.signatureRef)m.signatureRef=enc.signatureRef"));
 ok("cross-site evidence uses server-owned exact origins, not a last-two-label guess",
   html.includes("crossOriginProbe") && html.includes("configurationId")
     && html.includes("processEvidenceSha256") && html.includes("registrableParentSite")
@@ -135,6 +140,51 @@ ok("real-URL child realms require a build/artifact/capture/request handshake",
     && html.includes("payload._boundChild"));
 ok("all iframe variants explicitly delegate the keyboard-map policy",
   (html.match(/keyboard-map \*/g) || []).length >= 3);
+
+{
+  const bagStart = html.indexOf("function createBlobSidecarBag(");
+  const bagEnd = html.indexOf("\n  // Typed deep-walk", bagStart);
+  if (bagStart < 0 || bagEnd < 0) {
+    ok("production blob sidecar bag is executable", false);
+  } else {
+    const context = {};
+    vm.runInNewContext(html.slice(bagStart, bagEnd) + "\nthis.createBlobSidecarBag=createBlobSidecarBag;", context);
+    const bag = context.createBlobSidecarBag();
+    const payload = "probe-sidecar-\ud83e\uddea".repeat(1400);
+    const encoded = encodeValue(payload, { blobSink: bag.sink });
+    const ref = encoded.value.__blobRef;
+    const blobs = bag.values();
+    ok("real 20KB+ probe payload survives in an exact addressed sidecar",
+      payload.length > 20_000 && blobs.length === 1 && blobs[0].payload === payload
+        && blobs[0].locator === `fpblob:v1:${ref.addressSha256}`
+        && ref.locator === blobs[0].locator && ref.stored === false);
+  }
+}
+
+{
+  const sendStart = html.indexOf("function send(context,m){");
+  const sendEnd = html.indexOf("\nfunction createCompletionStateMachine(", sendStart);
+  if (sendStart < 0 || sendEnd < 0) {
+    ok("blob-aware send implementation is executable", false);
+  } else {
+    const requests = [];
+    const context = {
+      Promise,
+      RUN_IDENTITY: { captureKey: "pair-1:plain" }, COLLECT_URL: "/collect", SENDLOG: [],
+      log: () => {},
+      boundedFetch: async (url, options) => { requests.push({ url, options }); return { ok: true, status: 200 }; },
+    };
+    vm.runInNewContext(html.slice(sendStart, sendEnd) + "\nthis.send=send;", context);
+    const sidecar = { locator: "fpblob:v1:" + "a".repeat(64), payload: "x".repeat(20_001) };
+    const m = { _context: "main-frame", _blobPayloads: [sidecar], sample: 1 };
+    await context.send("main-frame", m);
+    const posted = JSON.parse(requests[0].options.body);
+    ok("send detaches sidecars from measurements and transports them once at the envelope level",
+      posted.m._blobPayloads === undefined && posted.m.sample === 1
+        && posted.blobs.length === 1 && posted.blobs[0].payload === sidecar.payload
+        && m._blobPayloads.length === 1 && m._blobPayloads[0] === sidecar);
+  }
+}
 
 {
   const bindingStart = html.indexOf("function canonicalIdentityJson(");
@@ -460,23 +510,81 @@ ok("AudioWorklet reuses the injected SHA implementation and emits its own manife
   if (machineStart >= 0 && machineEnd >= 0) {
     const context = { Promise };
     vm.runInNewContext(html.slice(machineStart, machineEnd + 2) + "\nthis.createCompletionStateMachine=createCompletionStateMachine;", context);
-    let collects = 0, manifestAttempts = 0;
+    let collects = 0, manifestAttempts = 0, statusChecks = 0;
     const sends = [];
+    const manifest = { manifestSha256: "a".repeat(64) };
     const machine = context.createCompletionStateMachine({
       collectPermissioned: async () => { collects++; return {}; },
       send: async (name) => {
         sends.push(name);
         if (name === "run-manifest" && ++manifestAttempts === 1) throw new Error("http-500");
       },
-      buildManifest: () => ({}),
-      queryStatus: async () => ({ ready: true, overall: "READY" }),
+      buildManifest: () => manifest,
+      queryStatus: async () => { statusChecks++; return { ready: false, overall: "NOT_READY",
+        captureComplete: true, committedManifestSha256: manifest.manifestSha256 }; },
       permissionedAcknowledged: () => {},
     });
-    try { await machine.run(); } catch {}
-    await machine.run();
-    ok("manifest retry after its failed ACK does not recollect or resend permissioned", collects === 1 && sends.join(",") === "permissioned,run-manifest,run-manifest");
+    const recovered = await machine.run();
+    ok("lost manifest ACK recovers in the same run from the exact committed digest",
+      recovered.captureComplete === true && collects === 1 && statusChecks === 1
+        && sends.join(",") === "permissioned,run-manifest" && machine.state.manifestAck === true);
   }
 }
+
+{
+  const machineStart = html.indexOf("function createCompletionStateMachine(");
+  const machineEnd = html.indexOf("\n}\n", machineStart);
+  if (machineStart >= 0 && machineEnd >= 0) {
+    const context = { Promise };
+    vm.runInNewContext(html.slice(machineStart, machineEnd + 2) + "\nthis.createCompletionStateMachine=createCompletionStateMachine;", context);
+    let builds = 0, manifestAttempts = 0, statusChecks = 0;
+    const manifest = { stable: true, manifestSha256: "b".repeat(64) };
+    const posted = [];
+    const machine = context.createCompletionStateMachine({
+      collectPermissioned: async () => ({}),
+      send: async (name, payload) => {
+        if (name !== "run-manifest") return;
+        posted.push(payload);
+        if (++manifestAttempts === 1) throw new Error("ambiguous-network-failure");
+      },
+      buildManifest: () => { builds++; return manifest; },
+      queryStatus: async () => (++statusChecks === 1
+        ? { ready: false, overall: "NOT_READY", captureComplete: false, committedManifestSha256: null }
+        : { ready: true, overall: "READY", captureComplete: true, committedManifestSha256: manifest.manifestSha256 }),
+      permissionedAcknowledged: () => {},
+    });
+    const completed = await machine.run();
+    ok("incomplete status retries the exact frozen manifest in the same run and then confirms status",
+      completed.ready === true && builds === 1 && posted.length === 2 && posted[0] === posted[1]
+        && statusChecks === 2 && machine.state.manifestAck === true);
+  }
+}
+
+{
+  const machineStart = html.indexOf("function createCompletionStateMachine(");
+  const machineEnd = html.indexOf("\n}\n", machineStart);
+  if (machineStart >= 0 && machineEnd >= 0) {
+    const context = { Promise };
+    vm.runInNewContext(html.slice(machineStart, machineEnd + 2) + "\nthis.createCompletionStateMachine=createCompletionStateMachine;", context);
+    const manifest = { manifestSha256: "c".repeat(64) };
+    let attempts = 0;
+    const machine = context.createCompletionStateMachine({
+      collectPermissioned: async () => ({}),
+      send: async (name) => { if (name === "run-manifest" && ++attempts === 1) throw new Error("lost");
+        if (name === "run-manifest") throw new Error("http-409"); },
+      buildManifest: () => manifest,
+      queryStatus: async () => ({ captureComplete: true, committedManifestSha256: "d".repeat(64) }),
+      permissionedAcknowledged: () => {},
+    });
+    let rejected = false; try { await machine.run(); } catch { rejected = true; }
+    ok("status for a different committed manifest never impersonates this run's ACK",
+      rejected && attempts === 2 && machine.state.manifestAck === false);
+  }
+}
+
+ok("terminal manifest carries a stable content digest over a detached SENDLOG snapshot",
+  html.includes("sendLog:SENDLOG.slice()")
+    && html.includes("manifest.manifestSha256=LinkageProbe.sha256hex(canonicalIdentityJson(manifest))"));
 
 {
   const start = html.indexOf("function captureCompletionOutcome(");
@@ -594,7 +702,7 @@ ok("AudioWorklet reuses the injected SHA implementation and emits its own manife
         URL: { revokeObjectURL: (url) => revoked.push(url) },
         setTimeout: (fn) => { const id = nextTimer++; timers.set(id, fn); return id; },
         clearTimeout: (id) => timers.delete(id),
-        typifyWorklet: () => [],
+        typifyWorklet: () => ({ records: [], blobs: [] }),
         send: async (...args) => { sends.push(args); },
         rstat: (...args) => statuses.push(args),
         log: () => {},
