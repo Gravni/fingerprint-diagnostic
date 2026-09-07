@@ -90,7 +90,9 @@ async function executeNetwork({ captureStatus = 200, rejectRound = 0 } = {}) {
 }
 
 ok("final UI consumes strict readiness, not legacy complete boolean",
-  html.includes("st.ready===true") && html.includes("st.overall==='READY'") && !html.includes("if(st&&st.complete)"));
+  (html.includes("st.ready===true") || html.includes("status.ready===true"))
+    && (html.includes("st.overall==='READY'") || html.includes("status.overall==='READY'"))
+    && !html.includes("if(st&&st.complete)"));
 ok("browser payloads never advertise an explicitly partial schema as current",
   !html.includes("typed-v4-partial") && html.includes("_schema='typed-v4'"));
 ok("the top-level harness invokes the two-round network flow exactly once",
@@ -473,6 +475,21 @@ ok("AudioWorklet reuses the injected SHA implementation and emits its own manife
     try { await machine.run(); } catch {}
     await machine.run();
     ok("manifest retry after its failed ACK does not recollect or resend permissioned", collects === 1 && sends.join(",") === "permissioned,run-manifest,run-manifest");
+  }
+}
+
+{
+  const start = html.indexOf("function captureCompletionOutcome(");
+  const end = html.indexOf("\nfunction blobURL(", start);
+  if (start < 0 || end < 0) {
+    ok("capture-completion UI classifier is executable", false);
+  } else {
+    const context = {};
+    vm.runInNewContext(html.slice(start, end) + "\nthis.captureCompletionOutcome=captureCompletionOutcome;", context);
+    ok("UI treats captureComplete=true / READY=false as a terminal one-shot raw capture",
+      context.captureCompletionOutcome({ ready: false, overall: "NOT_READY", captureComplete: true }) === "captured-not-ready");
+    ok("UI only offers retry for a structurally incomplete capture",
+      context.captureCompletionOutcome({ ready: false, overall: "NOT_READY", captureComplete: false }) === "incomplete");
   }
 }
 
@@ -1069,6 +1086,19 @@ ok("AudioWorklet reuses the injected SHA implementation and emits its own manife
         typedShape(typeError) && typeError.result === "error" && typeError.main?.status === "error"
           && typeError.main.error?.name === "TypeError" && typeError.main.error?.message === "bad constraints"
           && typeError.value("permissioned.getUserMedia.audioOnly") === null);
+    }
+    // A native per-track getter may throw. Preserve the typed failure instead
+    // of silently deleting the raw field from the one-shot capture.
+    {
+      const track = fakeTrack("audio");
+      track.getSettings = () => { throw domError("InvalidStateError", "track unavailable"); };
+      const video = fakeTrack("video");
+      const stream = { tracks: [track, video], getTracks: () => [track, video] };
+      const run = await runPermissioned({ getUserMedia: async () => stream });
+      const row = run.byPath.get("permissioned.track[0].settings");
+      ok("ADVERSARIAL: throwing track getter leaves typed raw error evidence",
+        row?.status === "error" && row.error?.name === "InvalidStateError"
+          && row.error?.message === "track unavailable");
     }
   }
 }

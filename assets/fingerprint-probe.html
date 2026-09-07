@@ -2057,6 +2057,11 @@ function createCompletionStateMachine(deps){
   }
   return {run:run,state:state};
 }
+function captureCompletionOutcome(status){
+  if(status&&status.ready===true&&status.overall==='READY') return 'ready';
+  if(status&&status.captureComplete===true) return 'captured-not-ready';
+  return 'incomplete';
+}
 function blobURL(src){ return URL.createObjectURL(new Blob([src],{type:'text/javascript'})); }
 
 // The audio-worklet realm posts a flat map (it can't run the M() pipeline). Type
@@ -2565,9 +2570,15 @@ function permissionedCollect(){
         var idx=gumTrackCount++; kinds.push(tr.kind);
         rec('permissioned.track['+idx+'].kind','ok',tr.kind);
         rec('permissioned.track['+idx+'].label','ok',tr.label||'');
-        try{ rec('permissioned.track['+idx+'].settings','ok', tr.getSettings?tr.getSettings():null); }catch(e){}
-        try{ rec('permissioned.track['+idx+'].capabilities','ok', tr.getCapabilities?tr.getCapabilities():null); }catch(e){}
-        try{ rec('permissioned.track['+idx+'].constraints','ok', tr.getConstraints?tr.getConstraints():null); }catch(e){}
+        [['settings','getSettings'],['capabilities','getCapabilities'],['constraints','getConstraints']].forEach(function(pair){
+          var path='permissioned.track['+idx+'].'+pair[0], method=pair[1];
+          if(typeof tr[method]!=='function'){
+            rec(path,'unavailable-in-context',null,{name:'NotSupportedError',message:method+' unavailable'});
+            return;
+          }
+          try{ rec(path,'ok',tr[method]()); }
+          catch(e){ rec(path,'error',null,{name:gumErrorName(e)||'Error',message:gumErrorMessage(e)||''}); }
+        });
       });
       return kinds;
     }
@@ -2737,16 +2748,23 @@ function permissionedCollect(){
     // performs only this status query; acknowledged payloads are never duplicated.
     return completion.run().then(function(st){
       if(st===null){ log('готово локально (сессия без env/sid — НЕ боевой снимок)','err'); return false; }
-      if(st&&st.ready===true&&st.overall==='READY'){ log('готово — строгий валидатор подтвердил полный сбор этой стороны ('+(st.present?st.present.length:'?')+' контекстов), можно закрывать вкладку','big'); return true; }
+      var outcome=captureCompletionOutcome(st);
+      if(outcome==='ready'){ log('готово — строгий валидатор подтвердил полный сбор этой стороны ('+(st.present?st.present.length:'?')+' контекстов), можно закрывать вкладку','big'); return outcome; }
       var why=(st&&Array.isArray(st.issues))?st.issues.map(function(x){return x.code+(x.context?':'+x.context:'');}).join(', '):'нет строгого verdict';
-      log('сбор записан, но строгий валидатор вернул NOT_READY: '+why+' — это НЕ боевой снимок','err'); return false;
+      if(outcome==='captured-not-ready'){
+        log('raw-сбор полностью записан; строгий валидатор вернул NOT_READY: '+why+' — повторно снимать не нужно, данные готовы к анализу','err');
+        return outcome;
+      }
+      log('сбор неполный: '+why,'err'); return outcome;
     });
   }
   btn.onclick=function(){ btn.disabled=true;
     btn.textContent=completion.state.permissionedAck?'проверяю статус…':'снимаю…';
-    finishAndReport().then(function(serverConfirmed){
-      btn.textContent = serverConfirmed ? '✓ готово (подтверждено сервером)' : 'сбор неполный — см. лог, нажми ещё раз';
-      if(!serverConfirmed) btn.disabled=false;
+    finishAndReport().then(function(outcome){
+      btn.textContent = outcome==='ready' ? '✓ готово (подтверждено сервером)'
+        : outcome==='captured-not-ready' ? '✓ raw собран (NOT_READY; повтор не нужен)'
+        : 'сбор неполный — см. лог, нажми ещё раз';
+      if(outcome==='incomplete'||outcome===false) btn.disabled=false;
     }, function(e){
       rstat('permissioned', REALM_STATUS['permissioned']?REALM_STATUS['permissioned'].status:'error', e&&e.message);
       btn.textContent='не удалось (сеть?) — нажми ещё раз'; btn.disabled=false;

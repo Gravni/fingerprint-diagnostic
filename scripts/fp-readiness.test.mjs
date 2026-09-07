@@ -2019,5 +2019,22 @@ const has = (result, code) => result.issues.some((x) => x.code === code);
   ok("a non-terminal run-manifest realm keeps captureComplete false", !staleVerdict.ready && staleVerdict.captureComplete === false);
 }
 
+// A persisted but malformed context is not a complete raw capture merely
+// because its outer row and terminal manifest exist.
+{
+  const malformed = fullInput();
+  const target = malformed.records.find((row) => row.context === "dedicated-worker");
+  target.measurements = { _context: "dedicated-worker", _measurementsError: "ERR:TypeError" };
+  const verdict = validateSideCapture(malformed);
+  ok("ADVERSARIAL: malformed persisted realm is not captureComplete", verdict.captureComplete === false);
+}
+{
+  const incompletePermissioned = fullInput();
+  const target = incompletePermissioned.records.find((row) => row.context === "permissioned");
+  target.measurements._phaseManifest.complete = false;
+  const verdict = validateSideCapture(incompletePermissioned);
+  ok("ADVERSARIAL: incomplete permissioned phase is not captureComplete", verdict.captureComplete === false);
+}
+
 console.log(`\nfp-readiness: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
