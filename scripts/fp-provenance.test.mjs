@@ -196,5 +196,28 @@ if (typeof computeBuildIdentity === "function" && typeof normalizeExecutablePath
   }
 }
 
+// ---- reviewer #9: the collector build manifest covers the renderer + its import closure ----
+{
+  const { FP_COLLECTOR_INPUTS, FP_EXECUTABLE_TREE } = await import("../lib/fp-executable-tree.mjs");
+  const { readFileSync: rf, existsSync: ex } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const { dirname, join: j, posix } = await import("node:path");
+  const root = j(dirname(fileURLToPath(import.meta.url)), "..");
+  ok("collector manifest lists the renderer", FP_COLLECTOR_INPUTS.includes("lib/fp-probe-artifact.mjs"));
+  ok("collector manifest lists template + encoder", FP_COLLECTOR_INPUTS.includes("assets/fingerprint-probe.html") && FP_COLLECTOR_INPUTS.includes("lib/fp-encode.mjs"));
+  ok("every collector input exists as a regular file", FP_COLLECTOR_INPUTS.every((p) => ex(j(root, p))));
+  // static import closure of the renderer (relative .mjs imports only — the renderer is dependency-free)
+  const closure = new Set();
+  const walk = (rel) => {
+    if (closure.has(rel)) return; closure.add(rel);
+    const src = rf(j(root, rel), "utf8");
+    for (const m of src.matchAll(/\bfrom\s+["'](\.{1,2}\/[^"']+)["']/g)) walk(posix.normalize(posix.join(posix.dirname(rel), m[1])));
+  };
+  walk("lib/fp-probe-artifact.mjs");
+  ok("renderer import closure ⊆ collector manifest (" + [...closure].join(", ") + ")", [...closure].every((p) => FP_COLLECTOR_INPUTS.includes(p)));
+  ok("every lib/ collector input is part of the closed executable tree", FP_COLLECTOR_INPUTS.filter((p) => p.startsWith("lib/")).every((p) => FP_EXECUTABLE_TREE.files.includes(p)));
+  ok("collector manifest is sorted + unique", JSON.stringify([...FP_COLLECTOR_INPUTS]) === JSON.stringify([...new Set(FP_COLLECTOR_INPUTS)].sort()));
+}
+
 console.log(`\nfp-provenance: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
