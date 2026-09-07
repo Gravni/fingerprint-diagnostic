@@ -2336,7 +2336,9 @@ function viaCrossOrigin(){
   return (async function(){
     var ifr;
     try{
-      var xr=await boundedJson('/api/fingerprint/xprobe-url',{cache:'no-store'},10000,16384), r=xr.response;
+      // session-scoped (v4.5): the server resolves env&sid to the caller's OWN capture before answering
+      var xq=new URLSearchParams(location.search);
+      var xr=await boundedJson('/api/fingerprint/xprobe-url?env='+encodeURIComponent(xq.get('env')||'')+'&sid='+encodeURIComponent(xq.get('sid')||''),{cache:'no-store'},10000,16384), r=xr.response;
       if(!r.ok){ rstat('cross-origin-iframe','unsupported','not deployed ('+r.status+')'); return; } // 503 = не развёрнут
       var j=xr.data; if(!j.url){ rstat('cross-origin-iframe','unsupported','no url'); return; }
       ifr=document.createElement('iframe');
