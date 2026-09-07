@@ -2542,6 +2542,14 @@ function permissionedCollect(){
         if(nm==='NotAllowedError'||nm==='SecurityError'){ gumState='denied'; manifest.denied.push('getUserMedia'); rec('permissioned.getUserMedia','permission-denied',null,{name:nm,message:e.message}); }
         else if(e&&e.message==='timeout'){ gumState='timeout'; manifest.timeout.push('getUserMedia'); rec('permissioned.getUserMedia','timeout',null); }
         else if(nm==='NotFoundError'||nm==='OverconstrainedError'){ gumState='no-device'; manifest.unsupported.push('getUserMedia'); rec('permissioned.getUserMedia','unavailable-in-context',null,{name:nm,message:e.message}); }
+        // Device enumerated but NOT startable: NotReadableError ("Could not start
+        // audio/video source" — OS/driver refused, or an anti-detect profile whose
+        // fake mediaDevices exist only in enumerateDevices), AbortError,
+        // NotSupportedError. An environment outcome exactly like geo
+        // POSITION_UNAVAILABLE → the enumerated `unavailable-in-context`, never a
+        // raw `error` (that means a collector bug and blocks readiness). name +
+        // message are kept, so plain=granted vs anti=NotReadableError stays a signal.
+        else if(nm==='NotReadableError'||nm==='AbortError'||nm==='NotSupportedError'){ gumState='device-unreadable'; manifest.unsupported.push('getUserMedia'); rec('permissioned.getUserMedia','unavailable-in-context',null,{name:nm,message:e.message}); }
         else { gumState='error'; rec('permissioned.getUserMedia','error',null,{name:nm,message:e&&e.message}); }
       }finally{ if(stream)releaseMediaStream(stream); }
     } else { manifest.unsupported.push('getUserMedia'); rec('permissioned.getUserMedia','unavailable-in-context',null); }

@@ -891,5 +891,67 @@ ok("AudioWorklet reuses the injected SHA implementation and emits its own manife
   }
 }
 
+{
+  // permissioned getUserMedia: every DOMException the browser can raise must land
+  // on an ENUMERATED status. A device that enumerates but cannot be started
+  // (NotReadableError "Could not start audio source" — OS/driver refusal, or an
+  // anti-detect profile with fake mediaDevices) is an environment outcome →
+  // `unavailable-in-context` (allowlisted for READY), never a raw `error`
+  // (collector bug, blocks readiness). Unknown names stay strict.
+  const permStart = html.indexOf("\nfunction permissionedCollect()");
+  const permEnd = html.indexOf("\n(async function(){", permStart);
+  if (permStart < 0 || permEnd < 0) {
+    ok("permissioned collector is executable", false);
+  } else {
+    const { validateMeasurement, nonOkAllowed } = await import("../lib/fp-schema.mjs");
+    async function runPermissioned(gumError) {
+      const err = new Error(gumError.message); err.name = gumError.name;
+      const context = {
+        Promise,
+        self: { LinkageProbe: { encodeValue: (v) => ({ valueType: typeof v, value: v }), hash: (s) => "h:" + s } },
+        navigator: {
+          mediaDevices: {
+            enumerateDevices: async () => [{ kind: "audioinput", label: "", deviceId: "a", groupId: "g" }],
+            getUserMedia: () => Promise.reject(err),
+          },
+        },
+        requestUserMediaWithTimeout: (constraints) => context.navigator.mediaDevices.getUserMedia(constraints),
+        releaseMediaStream: () => { throw new Error("no stream to release on rejection"); },
+        setTimeout, clearTimeout,
+      };
+      vm.runInNewContext(html.slice(permStart, permEnd) + "\nthis.permissionedCollect=permissionedCollect;", context);
+      const out = await context.permissionedCollect();
+      const byPath = Object.fromEntries(out._measurements.map((r) => [r.path, r]));
+      return { out, byPath, gum: byPath["permissioned.getUserMedia"], result: byPath["permissioned.getUserMedia.result"] };
+    }
+
+    const unreadable = await runPermissioned({ name: "NotReadableError", message: "Could not start audio source" });
+    ok("NotReadableError → permissioned.getUserMedia is unavailable-in-context with the DOMException kept",
+      unreadable.gum?.status === "unavailable-in-context" && unreadable.gum.value === null
+        && unreadable.gum.error?.name === "NotReadableError" && unreadable.gum.error?.message === "Could not start audio source");
+    ok("NotReadableError → result/manifest report device-unreadable and the phase still completes",
+      unreadable.result?.value === "device-unreadable" && unreadable.out._phaseManifest.steps.getUserMedia === "device-unreadable"
+        && unreadable.out._phaseManifest.unsupported.includes("getUserMedia") && unreadable.out._phaseManifest.complete === true);
+    ok("NotReadableError record is schema-valid and READY-allowlisted",
+      validateMeasurement(unreadable.gum).length === 0 && nonOkAllowed(unreadable.gum.path, "permissioned", unreadable.gum.status));
+    ok("every permissioned record of the unreadable run is schema-valid",
+      unreadable.out._measurements.every((r) => validateMeasurement(r).length === 0));
+
+    const noDevice = await runPermissioned({ name: "NotFoundError", message: "Requested device not found" });
+    ok("NotFoundError still maps to no-device / unavailable-in-context",
+      noDevice.gum?.status === "unavailable-in-context" && noDevice.result?.value === "no-device");
+
+    const denied = await runPermissioned({ name: "NotAllowedError", message: "Permission denied" });
+    ok("NotAllowedError still maps to permission-denied (not READY-allowlisted)",
+      denied.gum?.status === "permission-denied" && denied.result?.value === "denied"
+        && !nonOkAllowed(denied.gum.path, "permissioned", denied.gum.status));
+
+    const unknown = await runPermissioned({ name: "TypeError", message: "Failed to execute 'getUserMedia'" });
+    ok("an unmapped exception stays a strict raw error that blocks readiness",
+      unknown.gum?.status === "error" && unknown.gum.error?.name === "TypeError" && unknown.result?.value === "error"
+        && validateMeasurement(unknown.gum).length === 0 && !nonOkAllowed(unknown.gum.path, "permissioned", unknown.gum.status));
+  }
+}
+
 console.log(`\nfp-probe: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
