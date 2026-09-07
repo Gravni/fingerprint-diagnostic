@@ -2458,7 +2458,9 @@ function requestUserMediaWithTimeout(constraints,timeoutMs){
   return new Promise(function(resolve,reject){
     var settled=false;
     var pending={abort:function(){
-      var error=new Error('page hidden while getUserMedia was pending'); error.name='AbortError';
+      // SYNTHETIC abort raised by the collector on pagehide. The marker lets
+      // permissionedCollect() tell it apart from a NATIVE AbortError.
+      var error=new Error('page hidden while getUserMedia was pending'); error.name='AbortError'; error.fpSynthetic='pagehide';
       finish(reject,error);
     }};
     function removePending(){
@@ -2522,30 +2524,106 @@ function permissionedCollect(){
     manifest.requested.push('enumerateDevices');
     var devBefore=await enumerate('before'); manifest.steps.enumerateBefore=!!devBefore;
 
-    // 3. getUserMedia({audio,video}) — the REAL prompt; capture then stop tracks
+    // 3. getUserMedia({audio,video}) — the REAL prompt; capture then stop tracks.
+    //    Typed failure model (Codex v4.5):
+    //     · NotFoundError      → 'no-device' — then INDEPENDENT audio-only and
+    //                            video-only requests confirm WHICH kind is missing;
+    //     · NotReadableError   → 'device-start-failure' — ONE bounded retry with
+    //                            the same constraints, then the same independent
+    //                            audio-only / video-only requests;
+    //     · AbortError         → 'aborted' (lifecycle failure) — a NATIVE abort is
+    //                            told apart from the collector's SYNTHETIC pagehide
+    //                            abort (err.fpSynthetic==='pagehide');
+    //     · NotSupportedError  → 'not-supported';
+    //     · NotAllowed/Security→ 'denied'; helper timeout → 'timeout';
+    //     · anything else      → 'error'.
+    //    Every attempt keeps name/message, constraints, index, duration,
+    //    visibility + lifecycle state; every granted stream is released and its
+    //    tracks are recorded as permissioned.track[i].*.
     manifest.requested.push('getUserMedia');
-    var gumState='unsupported';
-    if(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia){
-      var stream=null;
+    var gumState='unsupported', gumError=null, gumLifecycle='none', gumAttempts=[], gumSingle={audio:null,video:null}, gumTrackCount=0;
+    function gumVisibility(){ try{ return (typeof document!=='undefined'&&document&&document.visibilityState)||'unknown'; }catch(_){ return 'unknown'; } }
+    function gumErrorName(e){ return (e&&typeof e.name==='string'&&e.name)?e.name:null; }
+    function gumErrorMessage(e){ if(e===null||e===undefined)return null; try{ return (e.message!==undefined&&e.message!==null)?String(e.message):String(e); }catch(_){ return null; } }
+    function gumIsTimeout(e){ return !!e&&(e.name==='TimeoutError'||e.message==='timeout')&&!e.fpSynthetic; }
+    function gumClassify(e){
+      var nm=gumErrorName(e);
+      if(nm==='NotAllowedError'||nm==='SecurityError') return 'denied';
+      if(gumIsTimeout(e)) return 'timeout';
+      if(nm==='NotFoundError') return 'no-device';
+      if(nm==='NotReadableError') return 'device-start-failure';
+      if(nm==='AbortError') return 'aborted';
+      if(nm==='NotSupportedError') return 'not-supported';
+      return 'error';
+    }
+    function recordTracks(stream){
+      var tracks=[]; try{ tracks=stream&&stream.getTracks?stream.getTracks():[]; }catch(_){ tracks=[]; }
+      var kinds=[];
+      tracks.forEach(function(tr){
+        var idx=gumTrackCount++; kinds.push(tr.kind);
+        rec('permissioned.track['+idx+'].kind','ok',tr.kind);
+        rec('permissioned.track['+idx+'].label','ok',tr.label||'');
+        try{ rec('permissioned.track['+idx+'].settings','ok', tr.getSettings?tr.getSettings():null); }catch(e){}
+        try{ rec('permissioned.track['+idx+'].capabilities','ok', tr.getCapabilities?tr.getCapabilities():null); }catch(e){}
+        try{ rec('permissioned.track['+idx+'].constraints','ok', tr.getConstraints?tr.getConstraints():null); }catch(e){}
+      });
+      return kinds;
+    }
+    async function gumAttempt(constraints,timeoutMs){
+      var t0=Date.now(), stream=null;
+      var entry={ attempt:gumAttempts.length+1, constraints:{audio:!!constraints.audio, video:!!constraints.video},
+        outcome:'rejected', name:null, message:null, durationMs:0, visibilityState:gumVisibility(), lifecycle:'live' };
+      var result={ entry:entry, error:null, trackKinds:[] };
       try{
-        stream=await requestUserMediaWithTimeout({audio:true,video:true},20000);
-        gumState='granted'; manifest.granted.push('getUserMedia');
-        stream.getTracks().forEach(function(tr,idx){
-          rec('permissioned.track['+idx+'].kind','ok',tr.kind);
-          rec('permissioned.track['+idx+'].label','ok',tr.label||'');
-          try{ rec('permissioned.track['+idx+'].settings','ok', tr.getSettings?tr.getSettings():null); }catch(e){}
-          try{ rec('permissioned.track['+idx+'].capabilities','ok', tr.getCapabilities?tr.getCapabilities():null); }catch(e){}
-          try{ rec('permissioned.track['+idx+'].constraints','ok', tr.getConstraints?tr.getConstraints():null); }catch(e){}
-        });
+        stream=await requestUserMediaWithTimeout(constraints,timeoutMs);
+        entry.outcome='granted'; result.trackKinds=recordTracks(stream);
       }catch(e){
-        var nm=e&&e.name;
-        if(nm==='NotAllowedError'||nm==='SecurityError'){ gumState='denied'; manifest.denied.push('getUserMedia'); rec('permissioned.getUserMedia','permission-denied',null,{name:nm,message:e.message}); }
-        else if(e&&e.message==='timeout'){ gumState='timeout'; manifest.timeout.push('getUserMedia'); rec('permissioned.getUserMedia','timeout',null); }
-        else if(nm==='NotFoundError'||nm==='OverconstrainedError'){ gumState='no-device'; manifest.unsupported.push('getUserMedia'); rec('permissioned.getUserMedia','unavailable-in-context',null,{name:nm,message:e.message}); }
-        else { gumState='error'; rec('permissioned.getUserMedia','error',null,{name:nm,message:e&&e.message}); }
+        result.error=e; entry.name=gumErrorName(e); entry.message=gumErrorMessage(e);
+        entry.outcome=gumIsTimeout(e)?'timeout':'rejected';
+        entry.lifecycle=(e&&e.fpSynthetic==='pagehide')?'pagehide':'live';
       }finally{ if(stream)releaseMediaStream(stream); }
+      entry.durationMs=Math.max(0,Date.now()-t0);
+      gumAttempts.push(entry);
+      return result;
+    }
+    function gumSingleRecord(r){
+      if(!r) return null;
+      return { outcome:r.entry.outcome, name:r.entry.name, message:r.entry.message, durationMs:r.entry.durationMs, trackKinds:r.trackKinds };
+    }
+    if(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia){
+      var combined=await gumAttempt({audio:true,video:true},20000);
+      if(combined.entry.outcome==='granted'){ gumState='granted'; }
+      else{
+        gumState=gumClassify(combined.error);
+        if(gumState==='device-start-failure'){
+          // ONE bounded retry with the same constraints.
+          combined=await gumAttempt({audio:true,video:true},20000);
+          gumState=combined.entry.outcome==='granted'?'granted':gumClassify(combined.error);
+        }
+        if(gumState==='device-start-failure'||gumState==='no-device'){
+          // Independent single-kind requests: confirm the missing / failing kind.
+          gumSingle.audio=await gumAttempt({audio:true},20000);
+          gumSingle.video=await gumAttempt({video:true},20000);
+        }
+      }
+      gumError=combined.error;
+      if(gumState==='aborted') gumLifecycle=(gumError&&gumError.fpSynthetic==='pagehide')?'synthetic-pagehide':'native';
+      var gumErr=gumState==='granted'?null:{name:gumErrorName(gumError)||'Error', message:gumErrorMessage(gumError)||''};
+      if(gumState==='granted'){ manifest.granted.push('getUserMedia'); }
+      else if(gumState==='denied'){ manifest.denied.push('getUserMedia'); rec('permissioned.getUserMedia','permission-denied',null,gumErr); }
+      else if(gumState==='timeout'){ manifest.timeout.push('getUserMedia'); rec('permissioned.getUserMedia','timeout',null); }
+      else if(gumState==='no-device'){ manifest.unsupported.push('getUserMedia'); rec('permissioned.getUserMedia','unavailable-in-context',null,gumErr); }
+      // device-start-failure / aborted / not-supported / error: raw `error` with
+      // the ORIGINAL name+message — intentionally keeps the strict verdict NOT_READY.
+      else { rec('permissioned.getUserMedia','error',null,gumErr); }
     } else { manifest.unsupported.push('getUserMedia'); rec('permissioned.getUserMedia','unavailable-in-context',null); }
     rec('permissioned.getUserMedia.result','ok',gumState); manifest.steps.getUserMedia=gumState;
+    rec('permissioned.getUserMedia.failure','ok', gumState==='granted'?'none':gumState);
+    rec('permissioned.getUserMedia.attempts','ok', gumAttempts);
+    rec('permissioned.getUserMedia.audioOnly','ok', gumSingleRecord(gumSingle.audio));
+    rec('permissioned.getUserMedia.videoOnly','ok', gumSingleRecord(gumSingle.video));
+    rec('permissioned.getUserMedia.lifecycle','ok', gumLifecycle);
+    rec('permissioned.getUserMedia.secureContext','ok', self.isSecureContext===true);
 
     // 4. enumerateDevices AFTER — labels now visible if granted
     var devAfter=await enumerate('after'); manifest.steps.enumerateAfter=!!devAfter;

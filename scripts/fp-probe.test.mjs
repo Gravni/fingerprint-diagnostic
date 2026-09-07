@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
-import { bytesHash, sha256hex } from "../lib/fp-encode.mjs";
+import { bytesHash, encodeValue, sha256hex } from "../lib/fp-encode.mjs";
+import { validateMeasurement } from "../lib/fp-schema.mjs";
 
 let pass = 0, fail = 0;
 function ok(label, cond) { if (cond) pass++; else { fail++; console.log("  ✗ " + label); } }
@@ -888,6 +889,187 @@ ok("AudioWorklet reuses the injected SHA implementation and emits its own manife
     ok("successful WebGPU compute unmaps and destroys buffers/device exactly once",
       readback.unmapCalls === 1 && readback.destroyCalls === 1
         && storage.destroyCalls === 1 && successDevice.destroyCalls === 1);
+  }
+}
+
+// ---- permissionedCollect(): typed getUserMedia failure model (Codex v4.5) ----
+{
+  const mediaStart = html.indexOf("var ACTIVE_MEDIA_STREAMS=");
+  const permStart = html.indexOf("\nfunction permissionedCollect()", mediaStart);
+  const permEnd = html.indexOf("\n(async function(){", permStart);
+  if (mediaStart < 0 || permStart < 0 || permEnd < 0) {
+    ok("permissionedCollect is executable", false);
+  } else {
+    const decode = (node) => {
+      if (!node || typeof node !== "object") return undefined;
+      if (node.valueType === "array") return node.value.map(decode);
+      if (node.valueType === "object") {
+        return Object.fromEntries(Object.entries(node.value.props).map(([key, child]) => [key, decode(child)]));
+      }
+      return node.value;
+    };
+    const domError = (name, message = name) => { const error = new Error(message); error.name = name; return error; };
+    const fakeTrack = (kind) => ({
+      kind, label: `${kind}-device`, stops: 0,
+      getSettings: () => ({ deviceId: `${kind}-id` }),
+      getCapabilities: () => ({ deviceId: `${kind}-id` }),
+      getConstraints: () => ({}),
+      stop() { this.stops++; },
+    });
+    const fakeStream = (...kinds) => { const tracks = kinds.map(fakeTrack); return { tracks, getTracks: () => tracks }; };
+    const DEVICES_BOTH = [
+      { kind: "audioinput", label: "", deviceId: "a", groupId: "g" },
+      { kind: "videoinput", label: "", deviceId: "v", groupId: "g" },
+    ];
+    async function runPermissioned({ getUserMedia, devices = DEVICES_BOTH, beforeSettle }) {
+      const listeners = {};
+      const calls = [];
+      const context = {
+        Promise, Error, console,
+        setTimeout, clearTimeout,
+        document: { visibilityState: "visible" },
+        window: { addEventListener: (name, fn) => { listeners[name] = fn; } },
+        self: { LinkageProbe: { encodeValue, hash: () => "00000000" }, isSecureContext: true },
+        navigator: { mediaDevices: {
+          enumerateDevices: async () => devices,
+          getUserMedia: (constraints) => { calls.push({ ...constraints }); return getUserMedia(constraints, calls.length); },
+        } },
+      };
+      vm.runInNewContext(html.slice(mediaStart, permEnd) + "\nthis.permissionedCollect=permissionedCollect;", context);
+      const run = context.permissionedCollect();
+      if (beforeSettle) await beforeSettle(listeners);
+      const out = await run;
+      const rows = out._measurements;
+      const byPath = new Map(rows.map((row) => [row.path, row]));
+      const value = (path) => decode(byPath.get(path));
+      const schemaErrors = rows.flatMap((row) => validateMeasurement(row).map((err) => `${row.path}:${err}`));
+      return { out, rows, byPath, value, calls, manifest: out._phaseManifest, schemaErrors, context,
+        result: value("permissioned.getUserMedia.result"), main: byPath.get("permissioned.getUserMedia") };
+    }
+    const typedShape = (run) => {
+      const attempts = run.value("permissioned.getUserMedia.attempts");
+      return run.schemaErrors.length === 0
+        && run.byPath.get("permissioned.getUserMedia.failure")?.status === "ok"
+        && run.value("permissioned.getUserMedia.failure") === (run.result === "granted" ? "none" : run.result)
+        && Array.isArray(attempts) && attempts.every((attempt, index) => attempt.attempt === index + 1
+          && typeof attempt.constraints.audio === "boolean" && typeof attempt.constraints.video === "boolean"
+          && typeof attempt.durationMs === "number" && attempt.visibilityState === "visible"
+          && ["live", "pagehide"].includes(attempt.lifecycle))
+        && ["native", "synthetic-pagehide", "none"].includes(run.value("permissioned.getUserMedia.lifecycle"))
+        && run.value("permissioned.getUserMedia.secureContext") === true
+        && run.byPath.has("permissioned.getUserMedia.audioOnly") && run.byPath.has("permissioned.getUserMedia.videoOnly")
+        && run.manifest.steps.getUserMedia === run.result;
+    };
+
+    // granted on the first attempt
+    {
+      const stream = fakeStream("audio", "video");
+      const run = await runPermissioned({ getUserMedia: async () => stream });
+      ok("granted getUserMedia keeps today's two-track evidence and adds typed 'none' failure rows",
+        typedShape(run) && run.result === "granted" && run.main === undefined
+          && run.value("permissioned.getUserMedia.attempts").length === 1
+          && run.value("permissioned.getUserMedia.attempts")[0].outcome === "granted"
+          && run.value("permissioned.getUserMedia.audioOnly") === null && run.value("permissioned.getUserMedia.videoOnly") === null
+          && run.value("permissioned.track[0].kind") === "audio" && run.value("permissioned.track[1].kind") === "video"
+          && stream.tracks.every((track) => track.stops === 1) && run.manifest.granted.includes("getUserMedia"));
+    }
+    // NotReadableError twice → single-kind requests; audio-only granted, video-only NotReadableError
+    {
+      const audioStream = fakeStream("audio");
+      const run = await runPermissioned({ getUserMedia: async (constraints, call) => {
+        if (call <= 2) throw domError("NotReadableError", "Could not start video source");
+        if (constraints.audio && !constraints.video) return audioStream;
+        throw domError("NotReadableError", "Could not start video source");
+      } });
+      const attempts = run.value("permissioned.getUserMedia.attempts");
+      ok("NotReadableError → device-start-failure after one bounded retry plus independent audio-only / video-only requests",
+        typedShape(run) && run.result === "device-start-failure" && attempts.length === 4
+          && run.calls.length === 4
+          && attempts[0].constraints.audio && attempts[0].constraints.video && attempts[1].constraints.audio && attempts[1].constraints.video
+          && attempts[2].constraints.audio && !attempts[2].constraints.video && !attempts[3].constraints.audio && attempts[3].constraints.video
+          && attempts[0].name === "NotReadableError" && attempts[1].name === "NotReadableError" && attempts[2].outcome === "granted"
+          && attempts[2].name === null && attempts[3].name === "NotReadableError"
+          && run.value("permissioned.getUserMedia.audioOnly").outcome === "granted"
+          && run.value("permissioned.getUserMedia.audioOnly").trackKinds.join() === "audio"
+          && run.value("permissioned.getUserMedia.videoOnly").outcome === "rejected"
+          && run.value("permissioned.getUserMedia.videoOnly").name === "NotReadableError"
+          && run.value("permissioned.getUserMedia.videoOnly").message === "Could not start video source"
+          && run.value("permissioned.getUserMedia.lifecycle") === "none");
+      ok("device-start-failure records the granted single-kind track and a raw error main record with the ORIGINAL name",
+        run.value("permissioned.track[0].kind") === "audio" && !run.byPath.has("permissioned.track[1].kind")
+          && audioStream.tracks[0].stops === 1
+          && run.main?.status === "error" && run.main.error?.name === "NotReadableError"
+          && run.main.error?.message === "Could not start video source"
+          && !run.manifest.granted.includes("getUserMedia") && !run.manifest.unsupported.includes("getUserMedia"));
+    }
+    // NotReadableError once, retry granted
+    {
+      const run = await runPermissioned({ getUserMedia: async (constraints, call) => {
+        if (call === 1) throw domError("NotReadableError");
+        return fakeStream("audio", "video");
+      } });
+      const attempts = run.value("permissioned.getUserMedia.attempts");
+      ok("a NotReadableError that clears on the bounded retry is granted with two attempts and no single-kind requests",
+        typedShape(run) && run.result === "granted" && attempts.length === 2 && attempts[1].outcome === "granted"
+          && run.value("permissioned.getUserMedia.audioOnly") === null && run.main === undefined);
+    }
+    // NotFoundError with no videoinput enumerated; audio-only granted
+    {
+      const run = await runPermissioned({
+        devices: [{ kind: "audioinput", label: "", deviceId: "a", groupId: "g" }, { kind: "audiooutput", label: "", deviceId: "s", groupId: "g" }],
+        getUserMedia: async (constraints) => {
+          if (constraints.video) throw domError("NotFoundError", "Requested device not found");
+          return fakeStream("audio");
+        },
+      });
+      const attempts = run.value("permissioned.getUserMedia.attempts");
+      ok("NotFoundError → no-device with independent single-kind confirmation of the missing kind",
+        typedShape(run) && run.result === "no-device" && attempts.length === 3 && run.calls.length === 3
+          && run.value("permissioned.getUserMedia.audioOnly").outcome === "granted"
+          && run.value("permissioned.getUserMedia.videoOnly").name === "NotFoundError"
+          && run.value("permissioned.track[0].kind") === "audio"
+          && run.main?.status === "unavailable-in-context" && run.main.error?.name === "NotFoundError"
+          && run.manifest.unsupported.includes("getUserMedia"));
+    }
+    // native AbortError
+    {
+      const run = await runPermissioned({ getUserMedia: async () => { throw domError("AbortError", "device aborted"); } });
+      ok("native AbortError → aborted with lifecycle 'native'",
+        typedShape(run) && run.result === "aborted" && run.value("permissioned.getUserMedia.lifecycle") === "native"
+          && run.value("permissioned.getUserMedia.attempts").length === 1
+          && run.value("permissioned.getUserMedia.attempts")[0].lifecycle === "live"
+          && run.main?.status === "error" && run.main.error?.name === "AbortError" && run.main.error?.message === "device aborted");
+    }
+    // synthetic pagehide abort raised by the real requestUserMediaWithTimeout
+    {
+      const run = await runPermissioned({
+        getUserMedia: () => new Promise(() => {}),
+        beforeSettle: async (listeners) => { await new Promise((resolve) => setTimeout(resolve, 5)); listeners.pagehide(); },
+      });
+      ok("collector's synthetic pagehide abort → aborted with lifecycle 'synthetic-pagehide'",
+        typedShape(run) && run.result === "aborted" && run.value("permissioned.getUserMedia.lifecycle") === "synthetic-pagehide"
+          && run.value("permissioned.getUserMedia.attempts").length === 1
+          && run.value("permissioned.getUserMedia.attempts")[0].lifecycle === "pagehide"
+          && run.main?.status === "error" && run.main.error?.name === "AbortError"
+          && run.context.PENDING_MEDIA_REQUESTS.length === 0);
+    }
+    // NotSupportedError / NotAllowedError / TypeError
+    {
+      const notSupported = await runPermissioned({ getUserMedia: async () => { throw domError("NotSupportedError"); } });
+      ok("NotSupportedError → not-supported with a raw error main record",
+        typedShape(notSupported) && notSupported.result === "not-supported"
+          && notSupported.main?.status === "error" && notSupported.main.error?.name === "NotSupportedError"
+          && notSupported.value("permissioned.getUserMedia.attempts").length === 1);
+      const denied = await runPermissioned({ getUserMedia: async () => { throw domError("NotAllowedError", "Permission denied"); } });
+      ok("NotAllowedError → denied with permission-denied main record",
+        typedShape(denied) && denied.result === "denied" && denied.main?.status === "permission-denied"
+          && denied.main.error?.name === "NotAllowedError" && denied.manifest.denied.includes("getUserMedia"));
+      const typeError = await runPermissioned({ getUserMedia: async () => { throw new TypeError("bad constraints"); } });
+      ok("unknown error names → error with the original name kept",
+        typedShape(typeError) && typeError.result === "error" && typeError.main?.status === "error"
+          && typeError.main.error?.name === "TypeError" && typeError.main.error?.message === "bad constraints"
+          && typeError.value("permissioned.getUserMedia.audioOnly") === null);
+    }
   }
 }
 

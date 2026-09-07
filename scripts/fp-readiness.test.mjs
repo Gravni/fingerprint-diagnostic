@@ -529,6 +529,71 @@ function manifest(status = "finished", expected = EXPECTED) {
     realms: Object.fromEntries(expected.map((c) => [c, { status }])),
   } };
 }
+function gumAttempt(attempt, constraints, outcome, name = null, message = null, lifecycle = "live") {
+  return { attempt, constraints: { audio: !!constraints.audio, video: !!constraints.video }, outcome, name, message,
+    durationMs: 120, visibilityState: "visible", lifecycle };
+}
+function gumSingle(outcome, name = null, message = null, trackKinds = []) {
+  return { outcome, name, message, durationMs: 90, trackKinds };
+}
+const PCTX = "permissioned";
+const prec = (path, value, extra = {}) => rec(path, value, { context: PCTX, phase: PCTX, ...extra });
+/** Rewrite the permissioned side of a complete READY input into a typed gUM outcome. */
+function withGumOutcome(input, { result, attempts, audioOnly = null, videoOnly = null, lifecycle = "none",
+  mainStatus, mainError, tracks, devicesBefore, devicesAfter }) {
+  const permissioned = input.records.find((row) => row.context === PCTX);
+  const isGumRow = (row) => row.path === "permissioned.getUserMedia"
+    || row.path.startsWith("permissioned.getUserMedia.") || row.path.startsWith("permissioned.track[")
+    || (devicesBefore && row.path.startsWith("permissioned.devices."));
+  const rows = permissioned.measurements._measurements.filter((row) => !isGumRow(row));
+  const deviceRows = (phase, list) => [
+    prec(`permissioned.devices.${phase}.count`, list.length),
+    prec(`permissioned.devices.${phase}.withLabels`, list.filter((device) => device.label).length),
+    ...list.flatMap((device, index) => [
+      prec(`permissioned.devices.${phase}[${index}].kind`, device.kind),
+      prec(`permissioned.devices.${phase}[${index}].label`, device.label),
+      prec(`permissioned.devices.${phase}[${index}].deviceId`, device.deviceId),
+      prec(`permissioned.devices.${phase}[${index}].groupId`, device.groupId),
+    ]),
+  ];
+  if (devicesBefore) {
+    rows.push(...deviceRows("before", devicesBefore), ...deviceRows("after", devicesAfter));
+    rows.push(prec("permissioned.devices.labelsRevealed",
+      devicesAfter.filter((device) => device.label).length > devicesBefore.filter((device) => device.label).length));
+  }
+  if (mainStatus) rows.push(prec("permissioned.getUserMedia", null, { status: mainStatus, error: mainError || null }));
+  rows.push(
+    prec("permissioned.getUserMedia.result", result),
+    prec("permissioned.getUserMedia.failure", result === "granted" ? "none" : result),
+    prec("permissioned.getUserMedia.attempts", attempts),
+    prec("permissioned.getUserMedia.audioOnly", audioOnly),
+    prec("permissioned.getUserMedia.videoOnly", videoOnly),
+    prec("permissioned.getUserMedia.lifecycle", lifecycle),
+    prec("permissioned.getUserMedia.secureContext", true),
+  );
+  (tracks || []).forEach((track, index) => rows.push(
+    prec(`permissioned.track[${index}].kind`, track.kind),
+    prec(`permissioned.track[${index}].label`, track.label),
+    prec(`permissioned.track[${index}].settings`, track.settings),
+    prec(`permissioned.track[${index}].capabilities`, track.capabilities),
+    prec(`permissioned.track[${index}].constraints`, track.constraints),
+  ));
+  permissioned.measurements._measurements = rows;
+  const manifest = permissioned.measurements._phaseManifest;
+  manifest.granted = manifest.granted.filter((step) => step !== "getUserMedia");
+  if (result === "granted") manifest.granted.unshift("getUserMedia");
+  if (result === "denied") manifest.denied.push("getUserMedia");
+  if (result === "timeout") manifest.timeout.push("getUserMedia");
+  if (result === "no-device" || result === "unsupported") manifest.unsupported.push("getUserMedia");
+  manifest.steps.getUserMedia = result;
+  return input;
+}
+const AUDIO_TRACK = { kind: "audio", label: "Built-in Microphone", settings: { deviceId: "audio-device", sampleRate: 48000 },
+  capabilities: { sampleRate: { min: 8000, max: 48000 } }, constraints: { echoCancellation: true } };
+const AUDIO_DEVICES = (labelled) => [
+  { kind: "audioinput", label: labelled ? "Built-in Microphone" : "", deviceId: "audio-device", groupId: "audio-group" },
+  { kind: "audiooutput", label: labelled ? "Built-in Speaker" : "", deviceId: "speaker-device", groupId: "audio-group" },
+];
 function fullInput(overrides = {}) {
   const environment = overrides.environment || "plain";
   const pairKey = overrides.pairKey || "pair-1";
@@ -583,6 +648,12 @@ function fullInput(overrides = {}) {
     rec("permissioned.devices.after[1].groupId", "video-group", { context: pctx, phase: pctx }),
     rec("permissioned.devices.labelsRevealed", true, { context: pctx, phase: pctx }),
     rec("permissioned.getUserMedia.result", "granted", { context: pctx, phase: pctx }),
+    rec("permissioned.getUserMedia.failure", "none", { context: pctx, phase: pctx }),
+    rec("permissioned.getUserMedia.attempts", [gumAttempt(1, { audio: true, video: true }, "granted")], { context: pctx, phase: pctx }),
+    rec("permissioned.getUserMedia.audioOnly", null, { context: pctx, phase: pctx }),
+    rec("permissioned.getUserMedia.videoOnly", null, { context: pctx, phase: pctx }),
+    rec("permissioned.getUserMedia.lifecycle", "none", { context: pctx, phase: pctx }),
+    rec("permissioned.getUserMedia.secureContext", true, { context: pctx, phase: pctx }),
     rec("permissioned.track[0].kind", "audio", { context: pctx, phase: pctx }),
     rec("permissioned.track[0].label", "Built-in Microphone", { context: pctx, phase: pctx }),
     rec("permissioned.track[0].settings", { deviceId: "audio-device", sampleRate: 48000 }, { context: pctx, phase: pctx }),
@@ -1774,6 +1845,178 @@ const has = (result, code) => result.issues.some((x) => x.code === code);
   const v = validateSideCapture(input);
   ok("ClientJS cannot self-authorize a changed getter surface",
     !v.ready && has(v, "control-incomplete"));
+}
+
+// ---- Typed getUserMedia failure model (Codex v4.5) ----
+{
+  const v = validateSideCapture(fullInput());
+  ok("untouched READY fixture stays READY and is a complete capture", v.ready && v.captureComplete === true);
+  const paired = validatePairedCapture({ plain: fullInput(), anti: fullInput({ environment: "anti" }) });
+  ok("paired verdict exposes captureComplete for both sides",
+    paired.ready && paired.captureComplete === true && paired.plain.captureComplete === true && paired.anti.captureComplete === true);
+}
+{
+  const input = withGumOutcome(fullInput(), {
+    result: "device-start-failure",
+    attempts: [
+      gumAttempt(1, { audio: true, video: true }, "rejected", "NotReadableError", "Could not start video source"),
+      gumAttempt(2, { audio: true, video: true }, "rejected", "NotReadableError", "Could not start video source"),
+      gumAttempt(3, { audio: true }, "rejected", "NotReadableError", "Could not start audio source"),
+      gumAttempt(4, { video: true }, "rejected", "NotReadableError", "Could not start video source"),
+    ],
+    audioOnly: gumSingle("rejected", "NotReadableError", "Could not start audio source"),
+    videoOnly: gumSingle("rejected", "NotReadableError", "Could not start video source"),
+    mainStatus: "error", mainError: { name: "NotReadableError", message: "Could not start video source" },
+    tracks: [],
+  });
+  const v = validateSideCapture(input);
+  ok("FULL validator: complete side with device-start-failure and no tracks is NOT_READY",
+    v.ready === false && v.overall === "NOT_READY" && has(v, "permissioned-getusermedia-device-start-failure")
+      && has(v, "unexpected-non-ok") && !has(v, "permissioned-getusermedia-evidence-invalid"));
+  ok("device-start-failure is still a COMPLETE capture (persisted diagnostics, strict verdict NOT_READY)",
+    v.captureComplete === true);
+  const paired = validatePairedCapture({ plain: input, anti: fullInput({ environment: "anti" }) });
+  ok("device-start-failure on one side blocks the pair but keeps captureComplete", !paired.ready && paired.captureComplete === true);
+}
+{
+  const input = withGumOutcome(fullInput(), {
+    result: "no-device",
+    attempts: [
+      gumAttempt(1, { audio: true, video: true }, "rejected", "NotFoundError", "Requested device not found"),
+      gumAttempt(2, { audio: true }, "granted"),
+      gumAttempt(3, { video: true }, "rejected", "NotFoundError", "Requested device not found"),
+    ],
+    audioOnly: gumSingle("granted", null, null, ["audio"]),
+    videoOnly: gumSingle("rejected", "NotFoundError", "Requested device not found"),
+    mainStatus: "unavailable-in-context", mainError: { name: "NotFoundError", message: "Requested device not found" },
+    tracks: [AUDIO_TRACK],
+    devicesBefore: AUDIO_DEVICES(false), devicesAfter: AUDIO_DEVICES(true),
+  });
+  const v = validateSideCapture(input);
+  ok("confirmed no-device (no videoinput enumerated, audio-only granted with an audio track) raises no gUM issue",
+    !v.issues.some((entry) => entry.code.startsWith("permissioned-")) && v.ready && v.captureComplete === true);
+}
+{
+  const input = withGumOutcome(fullInput(), {
+    result: "no-device",
+    attempts: [
+      gumAttempt(1, { audio: true, video: true }, "rejected", "NotFoundError", "Requested device not found"),
+      gumAttempt(2, { audio: true }, "granted"),
+      gumAttempt(3, { video: true }, "rejected", "NotFoundError", "Requested device not found"),
+    ],
+    audioOnly: gumSingle("granted", null, null, ["audio"]),
+    videoOnly: gumSingle("rejected", "NotFoundError", "Requested device not found"),
+    mainStatus: "unavailable-in-context", mainError: { name: "NotFoundError", message: "Requested device not found" },
+    tracks: [AUDIO_TRACK],
+  });
+  const v = validateSideCapture(input);
+  ok("unconfirmed no-device (both kinds enumerated) is blocking",
+    !v.ready && has(v, "permissioned-no-device-unconfirmed") && has(v, "permissioned-track-evidence-invalid"));
+}
+{
+  const input = withGumOutcome(fullInput(), {
+    result: "no-device",
+    attempts: [
+      gumAttempt(1, { audio: true, video: true }, "rejected", "NotFoundError", "Requested device not found"),
+      gumAttempt(2, { audio: true }, "rejected", "NotFoundError", "Requested device not found"),
+      gumAttempt(3, { video: true }, "rejected", "NotFoundError", "Requested device not found"),
+    ],
+    audioOnly: gumSingle("rejected", "NotFoundError", "Requested device not found"),
+    videoOnly: gumSingle("rejected", "NotFoundError", "Requested device not found"),
+    mainStatus: "unavailable-in-context", mainError: { name: "NotFoundError", message: "Requested device not found" },
+    tracks: [],
+    devicesBefore: AUDIO_DEVICES(false), devicesAfter: AUDIO_DEVICES(true),
+  });
+  const v = validateSideCapture(input);
+  ok("no-device is unconfirmed when a PRESENT kind was not granted with a recorded track",
+    !v.ready && has(v, "permissioned-no-device-unconfirmed"));
+}
+{
+  const aborted = (lifecycle, attemptLifecycle) => withGumOutcome(fullInput(), {
+    result: "aborted",
+    attempts: [gumAttempt(1, { audio: true, video: true }, "rejected", "AbortError", "aborted", attemptLifecycle)],
+    lifecycle,
+    mainStatus: "error", mainError: { name: "AbortError", message: "aborted" },
+    tracks: [],
+  });
+  const native = validateSideCapture(aborted("native", "live"));
+  const synthetic = validateSideCapture(aborted("synthetic-pagehide", "pagehide"));
+  ok("native AbortError is a blocking lifecycle failure carrying its lifecycle",
+    !native.ready && native.issues.some((entry) => entry.code === "permissioned-getusermedia-aborted" && entry.lifecycle === "native"));
+  ok("synthetic pagehide abort is a blocking lifecycle failure carrying its lifecycle",
+    !synthetic.ready && synthetic.issues.some((entry) => entry.code === "permissioned-getusermedia-aborted" && entry.lifecycle === "synthetic-pagehide"));
+  const mislabelled = validateSideCapture(withGumOutcome(fullInput(), {
+    result: "aborted",
+    attempts: [gumAttempt(1, { audio: true, video: true }, "rejected", "AbortError", "aborted")],
+    lifecycle: "none",
+    mainStatus: "error", mainError: { name: "AbortError", message: "aborted" }, tracks: [],
+  }));
+  ok("aborted without a lifecycle is malformed evidence", has(mislabelled, "permissioned-getusermedia-evidence-invalid"));
+}
+{
+  const notSupported = validateSideCapture(withGumOutcome(fullInput(), {
+    result: "not-supported",
+    attempts: [gumAttempt(1, { audio: true, video: true }, "rejected", "NotSupportedError", "not supported")],
+    mainStatus: "error", mainError: { name: "NotSupportedError", message: "not supported" }, tracks: [],
+  }));
+  ok("NotSupportedError is blocking", !notSupported.ready && has(notSupported, "permissioned-getusermedia-not-supported"));
+  const failures = [];
+  const generic = [
+    ["denied", "permission-denied", "NotAllowedError"],
+    ["timeout", "timeout", "TimeoutError"],
+    ["error", "error", "TypeError"],
+  ];
+  for (const [result, mainStatus, name] of generic) {
+    const v = validateSideCapture(withGumOutcome(fullInput(), {
+      result,
+      attempts: [gumAttempt(1, { audio: true, video: true }, result === "timeout" ? "timeout" : "rejected", name, "x")],
+      mainStatus, mainError: { name, message: "x" }, tracks: [],
+    }));
+    if (v.ready || !v.issues.some((entry) => entry.code === "permissioned-getusermedia-failed" && entry.result === result)) failures.push(result);
+  }
+  ok("denied / timeout / error results raise permissioned-getusermedia-failed", failures.length === 0);
+}
+{
+  const failures = [];
+  const detailPaths = ["permissioned.getUserMedia.failure", "permissioned.getUserMedia.attempts",
+    "permissioned.getUserMedia.audioOnly", "permissioned.getUserMedia.videoOnly",
+    "permissioned.getUserMedia.lifecycle", "permissioned.getUserMedia.secureContext"];
+  for (const path of detailPaths) {
+    const input = fullInput();
+    const permissioned = input.records.find((row) => row.context === PCTX);
+    permissioned.measurements._measurements = permissioned.measurements._measurements.filter((row) => row.path !== path);
+    const v = validateSideCapture(input);
+    if (v.ready || !has(v, "permissioned-getusermedia-evidence-invalid")) failures.push(path);
+  }
+  const mutations = [
+    ["permissioned.getUserMedia.failure", "denied"],
+    ["permissioned.getUserMedia.attempts", []],
+    ["permissioned.getUserMedia.attempts", [{ attempt: 1, constraints: { audio: true, video: true }, outcome: "granted" }]],
+    ["permissioned.getUserMedia.lifecycle", "native"],
+    ["permissioned.getUserMedia.secureContext", "true"],
+    ["permissioned.getUserMedia.audioOnly", gumSingle("granted", null, null, ["audio"])],
+  ];
+  for (const [path, value] of mutations) {
+    const input = fullInput();
+    const row = input.records.find((entry) => entry.context === PCTX)
+      .measurements._measurements.find((entry) => entry.path === path);
+    replaceEncodedTestValue(row, value);
+    const v = validateSideCapture(input);
+    if (v.ready || !has(v, "permissioned-getusermedia-evidence-invalid")) failures.push(`${path}=${JSON.stringify(value)}`);
+  }
+  ok("typed getUserMedia detail rows are required and shape-checked", failures.length === 0);
+}
+{
+  const input = fullInput();
+  input.records = input.records.filter((row) => row.context !== "credentialless-iframe");
+  const missing = validateSideCapture(input);
+  ok("a missing context is neither READY nor a complete capture", !missing.ready && missing.captureComplete === false);
+  const unreadable = validateSideCapture({ ...fullInput(), unreadableLines: 1 });
+  ok("unreadable lines keep captureComplete false", !unreadable.ready && unreadable.captureComplete === false);
+  const stale = fullInput();
+  stale.records.find((row) => row.context === "run-manifest").measurements.realms.network = { status: "pending" };
+  const staleVerdict = validateSideCapture(stale);
+  ok("a non-terminal run-manifest realm keeps captureComplete false", !staleVerdict.ready && staleVerdict.captureComplete === false);
 }
 
 console.log(`\nfp-readiness: ${pass} passed, ${fail} failed`);

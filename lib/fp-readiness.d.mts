@@ -85,6 +85,14 @@ export interface ReadinessIssue {
 export interface SideReadinessResult {
   readonly ready: boolean;
   readonly overall: "READY" | "NOT_READY";
+  /**
+   * The run finished and persisted: every server-expected context has a
+   * record, the run-manifest is terminal for each of them and no line was
+   * unreadable. Independent of `ready` — a typed getUserMedia failure
+   * (`device-start-failure` / `aborted` / `not-supported`) is a complete
+   * capture that is still NOT_READY.
+   */
+  readonly captureComplete: boolean;
   readonly expected: readonly string[];
   readonly present: readonly string[];
   readonly issues: readonly ReadinessIssue[];
@@ -93,6 +101,8 @@ export interface SideReadinessResult {
 export interface PairedReadinessResult {
   readonly ready: boolean;
   readonly overall: "READY" | "NOT_READY";
+  /** Both sides' `captureComplete`. */
+  readonly captureComplete: boolean;
   readonly plain: SideReadinessResult;
   readonly anti: SideReadinessResult;
   readonly issues: readonly ReadinessIssue[];

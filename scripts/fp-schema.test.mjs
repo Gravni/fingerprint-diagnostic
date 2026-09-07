@@ -408,6 +408,10 @@ ok("cross-origin iframe keyboard denial is not excused by sandbox rules",
   !nonOkAllowed("keyboard.available", "cross-origin-iframe", "blocked"));
 ok("UNEXPECTED: permission denial blocks a one-shot complete capture", !nonOkAllowed("permissioned.geo", "permissioned", "permission-denied"));
 ok("UNEXPECTED: permission timeout blocks a one-shot complete capture", !nonOkAllowed("permissioned.getUserMedia", "permissioned", "timeout"));
+ok("UNEXPECTED: raw getUserMedia error (device-start-failure / aborted / not-supported) blocks a one-shot complete capture",
+  !nonOkAllowed("permissioned.getUserMedia", "permissioned", "error"));
+ok("no-device is the only tolerated getUserMedia non-ok main record",
+  nonOkAllowed("permissioned.getUserMedia", "permissioned", "unavailable-in-context"));
 ok("UNEXPECTED: invalid device result is not an allowed capability absence", !nonOkAllowed("device.battery", "main-frame", "invalid-result"));
 ok("UNEXPECTED: realtime audio error is not silently accepted", !nonOkAllowed("audio.realtime.hash", "main-frame", "error"));
 ok("UNEXPECTED: WebRTC leaf cannot hide behind feature-family allowlist", !nonOkAllowed("webrtc.codecs", "main-frame", "blocked"));
