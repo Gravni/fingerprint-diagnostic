@@ -2050,6 +2050,14 @@ function rstat(name,status,detail){ if(!REALM_STATUS[name]||REALM_STATUS[name].s
 // send() MUST reject on HTTP non-2xx AND on network failure (Codex v4.2 #5): a
 // silently-swallowed failure was how a half-saved run looked "done". Callers that
 // must not hang still use .then(res,res); the failure is recorded in SENDLOG.
+// Transport retries (2026-09-07, seen in an anti-detect browser): one POST of a
+// realm that had collected fine stalled and never reached the server (15 s
+// timeout) → the context was missing → run-manifest 409 capture-incomplete →
+// the whole side unrecoverable, since passive realms are not re-run on retry.
+// The server upsert is idempotent per context and the run-manifest is
+// content-addressed, so replaying the SAME envelope is safe. Only transport
+// failures (timeout / network error) are retried, never an HTTP status.
+var SEND_ATTEMPTS=3;
 function send(context,m){
   if(!RUN_IDENTITY) return Promise.reject(new Error('capture identity not initialized'));
   var clean={}, blobs=[];
@@ -2058,17 +2066,27 @@ function send(context,m){
       if(Array.isArray(m[k])) blobs=m[k].slice();
     }else clean[k]=m[k];
   });
-  return boundedFetch(COLLECT_URL,{method:'POST',headers:{'content-type':'application/json'},
-    body:JSON.stringify({context:context,m:clean,blobs:blobs,identity:RUN_IDENTITY})},15000).then(function(r){
-      SENDLOG.push({context:context,ok:r.ok,status:r.status});
+  var body=JSON.stringify({context:context,m:clean,blobs:blobs,identity:RUN_IDENTITY});
+  var attempt=0;
+  function post(){
+    attempt++;
+    return boundedFetch(COLLECT_URL,{method:'POST',headers:{'content-type':'application/json'},body:body},15000).then(function(r){
+      SENDLOG.push({context:context,ok:r.ok,status:r.status,attempt:attempt});
       if(!r.ok){ log('  ✗ '+context+' '+r.status,'err'); throw new Error('http-'+r.status); }
-      log('  ✓ '+context+' ('+Object.keys(m).length+' параметров)','ok');
+      log('  ✓ '+context+' ('+Object.keys(m).length+' параметров)'+(attempt>1?' — записано с '+attempt+'-й попытки':''),'ok');
       return r;
     },function(e){
-      SENDLOG.push({context:context,ok:false,status:0,error:String(e&&e.message||e)});
-      log('  ✗ '+context+': '+(e&&e.message||e),'err');
+      var msg=String(e&&e.message||e);
+      SENDLOG.push({context:context,ok:false,status:0,error:msg,attempt:attempt});
+      if(attempt<SEND_ATTEMPTS){
+        log('  … '+context+': '+msg+' — повторяю отправку ('+attempt+'/'+(SEND_ATTEMPTS-1)+')','err');
+        return new Promise(function(r){ setTimeout(r,1000*attempt); }).then(post);
+      }
+      log('  ✗ '+context+': '+msg,'err');
       throw e;
     });
+  }
+  return post();
 }
 function createCompletionStateMachine(deps){
   var state={permissionedAck:false,manifestAck:false,manifestAttempted:false}, inFlight=null;

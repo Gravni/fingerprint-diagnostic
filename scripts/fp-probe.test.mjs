@@ -187,6 +187,44 @@ ok("all iframe variants explicitly delegate the keyboard-map policy",
 }
 
 {
+  // Transport retry: a stalled/dropped POST is replayed (same envelope) up to
+  // SEND_ATTEMPTS times; an HTTP error status is never retried.
+  const sendStart = html.indexOf("var SEND_ATTEMPTS=");
+  const sendEnd = html.indexOf("\nfunction createCompletionStateMachine(", sendStart);
+  if (sendStart < 0 || sendEnd < 0) {
+    ok("send retry implementation is executable", false);
+  } else {
+    const mk = (outcomes) => {
+      const bodies = [];
+      const context = {
+        Promise, setTimeout: (fn) => fn(),
+        RUN_IDENTITY: { captureKey: "pair-1:plain" }, COLLECT_URL: "/collect", SENDLOG: [],
+        log: () => {},
+        boundedFetch: async (url, options) => { bodies.push(options.body); const o = outcomes.shift(); if (o instanceof Error) throw o; return o; },
+      };
+      vm.runInNewContext(html.slice(sendStart, sendEnd) + "\nthis.send=send;", context);
+      return { context, bodies };
+    };
+    const timeout = () => Object.assign(new Error("fetch timeout after 15000ms"), { name: "TimeoutError" });
+    const a = mk([timeout(), new TypeError("Failed to fetch"), { ok: true, status: 200 }]);
+    let resolved = false;
+    await a.context.send("dedicated-worker", { x: 1 }).then(() => { resolved = true; }, () => {});
+    ok("send replays the identical envelope after transport failures and succeeds on the third attempt",
+      resolved && a.bodies.length === 3 && a.bodies[0] === a.bodies[2]
+        && a.context.SENDLOG.length === 3 && a.context.SENDLOG[2].ok === true && a.context.SENDLOG[2].attempt === 3);
+    const b = mk([timeout(), timeout(), timeout(), { ok: true, status: 200 }]);
+    let failed = null;
+    await b.context.send("dedicated-worker", { x: 1 }).catch((e) => { failed = e; });
+    ok("send gives up after SEND_ATTEMPTS transport failures with the last error",
+      failed && failed.name === "TimeoutError" && b.bodies.length === 3);
+    const c = mk([{ ok: false, status: 409 }, { ok: true, status: 200 }]);
+    let http = null;
+    await c.context.send("run-manifest", { x: 1 }).catch((e) => { http = e; });
+    ok("send never retries an HTTP error status", http && http.message === "http-409" && c.bodies.length === 1);
+  }
+}
+
+{
   const bindingStart = html.indexOf("function canonicalIdentityJson(");
   const bindingEnd = html.indexOf("// These are server/session facts", bindingStart);
   if (bindingStart < 0 || bindingEnd < 0) {
